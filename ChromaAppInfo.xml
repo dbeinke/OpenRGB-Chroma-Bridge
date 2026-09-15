@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<application>
+  <title>OpenRGB Chroma Bridge</title>
+  <description>Mirrors the active OpenRGB color profile to the Razer ManO'War headset.</description>
+  <author name="OpenRGB Chroma Bridge" contact="local"/>
+  <device_supported keyboard="0" mouse="0" headset="1" mousemat="0" keypad="0" chromalink="0"/>
+  <category game="0"/>
+</application>

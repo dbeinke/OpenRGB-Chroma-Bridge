@@ -1,0 +1,21 @@
+{
+  "Host": "127.0.0.1",
+  "Port": 6742,
+  "SourceDevice": "EVGA Z590 DARK USB",
+  "PollMilliseconds": 500,
+  "EnableDeviceBreathing": true,
+  "ProfileName": "White to Red - Speed 30",
+  "FollowSourceColor": false,
+  "BreathingColor": "#FFFFFF",
+  "BreathingSecondColor": "#FF0000",
+  "BreathingSpeed": 30,
+  "BreathingPeriodMilliseconds": 4000,
+  "BreathingFrameMilliseconds": 100,
+  "BreathingMinimumBrightness": 0.06,
+  "MaintainBrightness": true,
+  "EndpointHoldPercent": 10.0,
+  "HeadsetUpdateMilliseconds": 300,
+  "HeadsetPhaseLeadMilliseconds": 700,
+  "HeadsetRedThreshold": 0.65,
+  "ProfileCheckMilliseconds": 1000
+}
