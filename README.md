@@ -53,6 +53,9 @@ Copy `CChromaEditorLibrary64.dll` beside the published executable if it is not
 installed in the Windows system path. Edit `bridge-config.json` to match the
 OpenRGB source device and desired synchronized profile.
 
+The custom motherboard integration and verified HID report format are covered
+in [EVGA Z590 DARK USB lighting](docs/EVGA-Z590-DARK-USB.md).
+
 ## Operation
 
 The bridge starts automatically when the current Windows user signs in. It runs in
