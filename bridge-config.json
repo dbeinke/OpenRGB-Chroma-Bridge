@@ -1,7 +1,7 @@
 {
   "Host": "127.0.0.1",
   "Port": 6742,
-  "SourceDevice": "EVGA Z590 DARK USB",
+  "SourceDevice": "Chroma Bridge",
   "PollMilliseconds": 500,
   "EnableDeviceBreathing": true,
   "ProfileName": "White to Red - Speed 30",

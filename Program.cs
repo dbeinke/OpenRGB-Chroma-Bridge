@@ -9,7 +9,7 @@ internal sealed class BridgeConfig
 {
     public string Host { get; set; } = "127.0.0.1";
     public int Port { get; set; } = 6742;
-    public string SourceDevice { get; set; } = "EVGA Z590 DARK USB";
+    public string SourceDevice { get; set; } = "Chroma Bridge";
     public int PollMilliseconds { get; set; } = 500;
     public bool EnableDeviceBreathing { get; set; } = true;
     public string ProfileName { get; set; } = "White to Red - Speed 30";
@@ -251,6 +251,7 @@ internal static class Program
             bool synchronize = device.Name.StartsWith("TT LEDFanBox", StringComparison.OrdinalIgnoreCase) ||
                                device.Name.Equals("Razer Firefly", StringComparison.OrdinalIgnoreCase) ||
                                device.Name.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase) ||
+                               device.Name.Equals("EVGA Z590 DARK USB", StringComparison.OrdinalIgnoreCase) ||
                                device.Name.StartsWith("NVIDIA GeForce", StringComparison.OrdinalIgnoreCase);
             if (synchronize && device.Colors.Length > 0)
                 targets.Add((id, device.Colors.Length, device.Name));
@@ -270,19 +271,15 @@ internal static class Program
         for (int id = 0; id < count; id++)
         {
             Device device = client.GetControllerData(id);
-            string expected = device.Name.StartsWith("TT LEDFanBox", StringComparison.OrdinalIgnoreCase) ||
-                              device.Name.Equals("Razer Firefly", StringComparison.OrdinalIgnoreCase) ||
-                              device.Name.StartsWith("NVIDIA GeForce", StringComparison.OrdinalIgnoreCase)
-                ? "Direct"
-                : device.Name.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase)
-                    ? "Static"
-                    : string.Empty;
+            string expected = ExpectedOpenRgbMode(device.Name, config);
 
             if (expected.Length > 0 &&
                 !device.ActiveMode.Name.Equals(expected, StringComparison.OrdinalIgnoreCase))
                 modesChanged = true;
 
-            if (expected.Length > 0 && lastSentColor.HasValue && device.Colors.Length > 0 &&
+            if (expected.Length > 0 &&
+                !device.Name.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase) &&
+                lastSentColor.HasValue && device.Colors.Length > 0 &&
                 device.Colors[0] != lastSentColor.Value)
             {
                 if (device.Name.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase) ||
@@ -294,10 +291,23 @@ internal static class Program
         return new SyncClientState(modesChanged, overrideColor);
     }
 
+    private static string ExpectedOpenRgbMode(string deviceName, BridgeConfig config)
+    {
+        if (deviceName.Equals("EVGA Z590 DARK USB", StringComparison.OrdinalIgnoreCase))
+            return "Static";
+        if (deviceName.StartsWith("TT LEDFanBox", StringComparison.OrdinalIgnoreCase) ||
+            deviceName.Equals("Razer Firefly", StringComparison.OrdinalIgnoreCase) ||
+            deviceName.StartsWith("NVIDIA GeForce", StringComparison.OrdinalIgnoreCase) ||
+            deviceName.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase))
+            return "Direct";
+        return string.Empty;
+    }
+
     private static ClientColorCommand? DetectClientColorChange(
         BridgeConfig config,
         IEnumerable<(int Id, int LedCount, string Name)> targets,
-        Color? lastSentColor)
+        Color? lastSentColor,
+        Color? lastSourceColor)
     {
         if (!lastSentColor.HasValue)
             return null;
@@ -307,25 +317,39 @@ internal static class Program
         watcher.Connect();
         var targetList = targets.ToList();
         Color? changedColor = null;
-        int changedCount = 0;
-        bool allCurrentWhite = true;
+        int physicalCount = 0;
+        int changedPhysicalCount = 0;
+        bool allPhysicalWhite = true;
         foreach (var target in targetList)
         {
             Device device = watcher.GetControllerData(target.Id);
-            if (device.Colors.Length == 0 || device.Colors[0] != new Color(255, 255, 255))
-                allCurrentWhite = false;
+            bool isSource = device.Name.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase);
+            if (isSource)
+            {
+                if (device.Colors.Length > 0 && lastSourceColor.HasValue &&
+                    device.Colors[0] != lastSourceColor.Value)
+                    return new ClientColorCommand(device.Colors[0], false);
+                continue;
+            }
+            if (!isSource)
+            {
+                physicalCount++;
+                if (device.Colors.Length == 0 || device.Colors[0] != new Color(255, 255, 255))
+                    allPhysicalWhite = false;
+            }
             if (device.Colors.Length == 0 || device.Colors[0] == lastSentColor.Value)
                 continue;
 
-            changedCount++;
+            if (!isSource)
+                changedPhysicalCount++;
             changedColor = device.Colors[0];
-            if (device.Name.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase))
+            if (isSource)
                 changedColor = device.Colors[0];
         }
         if (!changedColor.HasValue)
             return null;
 
-        bool resumeProfile = allCurrentWhite && changedCount == targetList.Count;
+        bool resumeProfile = physicalCount > 0 && allPhysicalWhite && changedPhysicalCount == physicalCount;
         return new ClientColorCommand(changedColor.Value, resumeProfile);
     }
 
@@ -388,6 +412,7 @@ internal static class Program
 
     private static Color UpdateSynchronizedBreathing(
         OpenRgbClient client,
+        BridgeConfig config,
         IEnumerable<(int Id, int LedCount, string Name)> targets,
         Color firstColor,
         Color secondColor,
@@ -398,6 +423,8 @@ internal static class Program
 
         foreach (var target in targets)
         {
+            if (target.Name.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase))
+                continue;
             if (_traceFirstAnimationFrame)
                 Log($"Testing animation write to {target.Name}.");
             client.UpdateLeds(target.Id, Enumerable.Repeat(color, target.LedCount).ToArray());
@@ -485,12 +512,9 @@ internal static class Program
                     {
                         foreach (var target in setupTargets)
                         {
-                            if (target.Name.Equals("Razer Firefly", StringComparison.OrdinalIgnoreCase))
-                                SetOpenRgbMode(config, target.Name, "direct", breathingColor);
-                            else if (target.Name.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase))
-                                SetOpenRgbMode(config, target.Name, "static", breathingColor);
-                            else if (target.Name.StartsWith("NVIDIA GeForce", StringComparison.OrdinalIgnoreCase))
-                                SetOpenRgbMode(config, target.Name, "direct", breathingColor);
+                            string expectedMode = ExpectedOpenRgbMode(target.Name, config);
+                            if (expectedMode.Length > 0)
+                                SetOpenRgbMode(config, target.Name, expectedMode.ToLowerInvariant(), breathingColor);
                         }
                     }
 
@@ -506,6 +530,7 @@ internal static class Program
                     long nextFrameLog = 0;
                     long nextHeadsetFrame = 0;
                     Color? lastSentFrame = null;
+                    Color? lastSourceColor = breathingColor;
                     do
                     {
                         long elapsed = sessionTimer.ElapsedMilliseconds;
@@ -514,9 +539,11 @@ internal static class Program
                             chromaReady = true;
                             Log("Razer Chroma connected after delayed initialization; ManO'War synchronization resumed.");
                         }
-                        ClientColorCommand? clientColorChange = DetectClientColorChange(config, targets, lastSentFrame);
+                        ClientColorCommand? clientColorChange = DetectClientColorChange(
+                            config, targets, lastSentFrame, lastSourceColor);
                         if (clientColorChange.HasValue)
                         {
+                            lastSourceColor = clientColorChange.Value.Color;
                             if (clientColorChange.Value.ResumeSavedProfile)
                             {
                                 clientOverride = null;
@@ -588,7 +615,7 @@ internal static class Program
                             double level = config.MaintainBrightness
                                 ? 1.0
                                 : minimum + ((1.0 - minimum) * colorMix);
-                            Color frame = UpdateSynchronizedBreathing(client, targets, breathingColor,
+                            Color frame = UpdateSynchronizedBreathing(client, config, targets, breathingColor,
                                 breathingSecondColor, colorMix, level);
                             lastSentFrame = frame;
                             if (chromaReady && elapsed >= nextHeadsetFrame)
