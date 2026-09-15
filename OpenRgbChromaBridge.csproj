@@ -8,10 +8,13 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>OpenRGB-Chroma-Bridge</AssemblyName>
     <RootNamespace>OpenRgbChromaBridge</RootNamespace>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="OpenRGB.NET" Version="3.1.1" />
+    <Reference Include="OpenRGB.NET">
+      <HintPath>lib\OpenRGB.NET.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
   </ItemGroup>
   <ItemGroup>
     <None Include="bridge-config.json" CopyToOutputDirectory="PreserveNewest" />
@@ -20,5 +23,6 @@
     <None Include="ChromaAppInfo.xml" CopyToOutputDirectory="PreserveNewest" />
     <None Include="watchdog.ps1" CopyToOutputDirectory="PreserveNewest" />
     <None Include="install-virtual-controller.ps1" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="patches\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

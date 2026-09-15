@@ -1,0 +1,35 @@
+diff --git a/src/OpenRGB.NET/OpenRgbConnection.cs b/src/OpenRGB.NET/OpenRgbConnection.cs
+index 7e97f2e..bee5f46 100644
+--- a/src/OpenRGB.NET/OpenRgbConnection.cs
++++ b/src/OpenRGB.NET/OpenRgbConnection.cs
+@@ -157,6 +157,15 @@ internal sealed class OpenRgbConnection : IDisposable
+     {
+         _cancellationTokenSource.Cancel();
+         try
++        {
++            _socket.Shutdown(SocketShutdown.Both);
++        }
++        catch
++        {
++            // The socket may already be disconnected.
++        }
++        _socket.Dispose();
++        try
+         {
+             _readLoopTask?.Wait();
+         }
+@@ -166,7 +175,6 @@ internal sealed class OpenRgbConnection : IDisposable
+         }
+ 
+         _cancellationTokenSource.Dispose();
+-        _socket.Dispose();
+         _readLoopTask?.Dispose();
+     }
+ 
+@@ -184,4 +192,4 @@ internal sealed class OpenRgbConnection : IDisposable
+         
+         File.WriteAllBytes(Path.Combine(directory, $"{lastFileNumber + 1:D2}-{(sending ? "Send" : "Receive")}-{command}.bin"), buffer.ToArray());
+     }
+-}
+\ No newline at end of file
++}

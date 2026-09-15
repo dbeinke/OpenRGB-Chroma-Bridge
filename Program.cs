@@ -43,8 +43,9 @@ internal readonly record struct DesiredEffect(HeadsetEffect Effect, byte R, byte
         : $"{Effect} #{R:X2}{G:X2}{B:X2}";
 }
 
-internal readonly record struct SyncClientState(bool ModesChanged, Color? OverrideColor);
 internal readonly record struct ClientColorCommand(Color Color, bool ResumeSavedProfile);
+internal readonly record struct SourceModeState(
+    string Name, Color FirstColor, Color SecondColor, uint Speed, double Brightness, OpenRGB.NET.Direction Direction);
 
 internal static class ChromaNative
 {
@@ -229,6 +230,49 @@ internal static class Program
         return new DesiredEffect(effect, r, g, b);
     }
 
+    private static SourceModeState ReadSourceMode(OpenRgbClient client, BridgeConfig config)
+    {
+        int count = client.GetControllerCount();
+        for (int index = 0; index < count; index++)
+        {
+            Device device = client.GetControllerData(index);
+            if (!device.Name.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase))
+                continue;
+            return SourceModeFromDevice(device, config);
+        }
+
+        throw new InvalidOperationException($"OpenRGB source device '{config.SourceDevice}' was not found.");
+    }
+
+    private static int FindSourceId(OpenRgbClient client, BridgeConfig config)
+    {
+        int count = client.GetControllerCount();
+        for (int index = 0; index < count; index++)
+            if (client.GetControllerData(index).Name.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase))
+                return index;
+        throw new InvalidOperationException($"OpenRGB source device '{config.SourceDevice}' was not found.");
+    }
+
+    private static SourceModeState SourceModeFromDevice(Device device, BridgeConfig config)
+    {
+        Mode mode = device.ActiveMode;
+        Color fallback = device.Colors.Length > 0 ? device.Colors[0] : ParseColor(config.BreathingColor);
+        Color first = mode.Colors.Length > 0 ? mode.Colors[0] : fallback;
+        Color second = mode.Colors.Length > 1 ? mode.Colors[1] : ParseColor(config.BreathingSecondColor);
+        double brightness = mode.SupportsBrightness
+            ? Math.Clamp(mode.Brightness / (double)Math.Max(1u, mode.BrightnessMax), 0.0, 1.0)
+            : 1.0;
+        return new SourceModeState(mode.Name ?? "Direct", first, second, mode.Speed, brightness, mode.Direction);
+    }
+
+    private static SourceModeState InspectSourceMode(BridgeConfig config)
+    {
+        using var watcher = new OpenRgbClient(config.Host, config.Port,
+            "OpenRGB Chroma Bridge Mode Check", false, 1000);
+        watcher.Connect();
+        return ReadSourceMode(watcher, config);
+    }
+
     private static Color ParseColor(string value)
     {
         string hex = value.Trim().TrimStart('#');
@@ -260,97 +304,40 @@ internal static class Program
         return targets;
     }
 
-    private static SyncClientState InspectClientState(BridgeConfig config, Color? lastSentColor)
-    {
-        using var client = new OpenRgbClient(config.Host, config.Port,
-            "OpenRGB Chroma Bridge Profile Watcher", false, 1000);
-        client.Connect();
-        bool modesChanged = false;
-        Color? overrideColor = null;
-        int count = client.GetControllerCount();
-        for (int id = 0; id < count; id++)
-        {
-            Device device = client.GetControllerData(id);
-            string expected = ExpectedOpenRgbMode(device.Name, config);
-
-            if (expected.Length > 0 &&
-                !device.ActiveMode.Name.Equals(expected, StringComparison.OrdinalIgnoreCase))
-                modesChanged = true;
-
-            if (expected.Length > 0 &&
-                !device.Name.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase) &&
-                lastSentColor.HasValue && device.Colors.Length > 0 &&
-                device.Colors[0] != lastSentColor.Value)
-            {
-                if (device.Name.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase) ||
-                    !overrideColor.HasValue)
-                    overrideColor = device.Colors[0];
-            }
-        }
-
-        return new SyncClientState(modesChanged, overrideColor);
-    }
-
     private static string ExpectedOpenRgbMode(string deviceName, BridgeConfig config)
     {
+        if (deviceName.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase))
+            return string.Empty;
         if (deviceName.Equals("EVGA Z590 DARK USB", StringComparison.OrdinalIgnoreCase))
             return "Static";
         if (deviceName.StartsWith("TT LEDFanBox", StringComparison.OrdinalIgnoreCase) ||
             deviceName.Equals("Razer Firefly", StringComparison.OrdinalIgnoreCase) ||
-            deviceName.StartsWith("NVIDIA GeForce", StringComparison.OrdinalIgnoreCase) ||
-            deviceName.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase))
+            deviceName.StartsWith("NVIDIA GeForce", StringComparison.OrdinalIgnoreCase))
             return "Direct";
         return string.Empty;
     }
 
     private static ClientColorCommand? DetectClientColorChange(
         BridgeConfig config,
-        IEnumerable<(int Id, int LedCount, string Name)> targets,
+        int sourceId,
         Color? lastSentColor,
-        Color? lastSourceColor)
+        Color? lastSourceColor,
+        out SourceModeState? observedSourceMode)
     {
+        observedSourceMode = null;
         if (!lastSentColor.HasValue)
             return null;
 
         using var watcher = new OpenRgbClient(config.Host, config.Port,
-            "OpenRGB Chroma Bridge Color Watcher", false, 1000);
+            "OpenRGB Chroma Bridge Master Watcher", false, 1000);
         watcher.Connect();
-        var targetList = targets.ToList();
-        Color? changedColor = null;
-        int physicalCount = 0;
-        int changedPhysicalCount = 0;
-        bool allPhysicalWhite = true;
-        foreach (var target in targetList)
-        {
-            Device device = watcher.GetControllerData(target.Id);
-            bool isSource = device.Name.Equals(config.SourceDevice, StringComparison.OrdinalIgnoreCase);
-            if (isSource)
-            {
-                if (device.Colors.Length > 0 && lastSourceColor.HasValue &&
-                    device.Colors[0] != lastSourceColor.Value)
-                    return new ClientColorCommand(device.Colors[0], false);
-                continue;
-            }
-            if (!isSource)
-            {
-                physicalCount++;
-                if (device.Colors.Length == 0 || device.Colors[0] != new Color(255, 255, 255))
-                    allPhysicalWhite = false;
-            }
-            if (device.Colors.Length == 0 || device.Colors[0] == lastSentColor.Value)
-                continue;
-
-            if (!isSource)
-                changedPhysicalCount++;
-            changedColor = device.Colors[0];
-            if (isSource)
-                changedColor = device.Colors[0];
-        }
-        if (!changedColor.HasValue)
-            return null;
-
-        bool resumeProfile = physicalCount > 0 && allPhysicalWhite && changedPhysicalCount == physicalCount;
-        return new ClientColorCommand(changedColor.Value, resumeProfile);
+        Device source = watcher.GetControllerData(sourceId);
+        observedSourceMode = SourceModeFromDevice(source, config);
+        if (source.ActiveMode.Name.Equals("Direct", StringComparison.OrdinalIgnoreCase) &&
+            source.Colors.Length > 0 && lastSourceColor.HasValue &&
+            source.Colors[0] != lastSourceColor.Value)
+            return new ClientColorCommand(source.Colors[0], false);
+        return null;
     }
 
     private static void SetOpenRgbMode(BridgeConfig config, string deviceName, string mode, Color color)
@@ -380,15 +367,57 @@ internal static class Program
             throw new InvalidOperationException($"OpenRGB could not set {deviceName} to {mode} mode.");
     }
 
+    private static void EnsureOpenRgbModes(OpenRgbClient client, BridgeConfig config, Color color)
+    {
+        var changes = new List<(string Name, string Mode)>();
+        int count = client.GetControllerCount();
+        for (int index = 0; index < count; index++)
+        {
+            Device device = client.GetControllerData(index);
+            string expected = ExpectedOpenRgbMode(device.Name, config);
+            if (expected.Length > 0 &&
+                !device.ActiveMode.Name.Equals(expected, StringComparison.OrdinalIgnoreCase))
+                changes.Add((device.Name, expected));
+        }
+
+        foreach (var change in changes)
+            SetOpenRgbMode(config, change.Name, change.Mode.ToLowerInvariant(), color);
+    }
+
     private static double GetBreathingPeriod(BridgeConfig config)
     {
         if (!config.BreathingSpeed.HasValue)
             return Math.Clamp(config.BreathingPeriodMilliseconds, 1000, 30000);
 
-        double speed = Math.Clamp(config.BreathingSpeed.Value, 0, 100);
+        return GetPeriodForSpeed(config.BreathingSpeed.Value);
+    }
+
+    private static double GetPeriodForSpeed(double requestedSpeed)
+    {
+        double speed = Math.Clamp(requestedSpeed, 0, 100);
         return speed <= 50
             ? 20000.0 + ((5000.0 - 20000.0) * (speed / 50.0))
             : 5000.0 + ((1000.0 - 5000.0) * ((speed - 50.0) / 50.0));
+    }
+
+    private static Color HueColor(double hue, double brightness)
+    {
+        hue = ((hue % 1.0) + 1.0) % 1.0;
+        double scaled = hue * 6.0;
+        int sector = (int)Math.Floor(scaled);
+        double fraction = scaled - sector;
+        (double r, double g, double b) = sector switch
+        {
+            0 => (1.0, fraction, 0.0),
+            1 => (1.0 - fraction, 1.0, 0.0),
+            2 => (0.0, 1.0, fraction),
+            3 => (0.0, 1.0 - fraction, 1.0),
+            4 => (fraction, 0.0, 1.0),
+            _ => (1.0, 0.0, 1.0 - fraction)
+        };
+        double level = Math.Clamp(brightness, 0.0, 1.0);
+        return new Color((byte)Math.Round(r * 255 * level),
+            (byte)Math.Round(g * 255 * level), (byte)Math.Round(b * 255 * level));
     }
 
     private static double GetColorMix(double phase, double endpointHoldPercent)
@@ -417,7 +446,9 @@ internal static class Program
         Color firstColor,
         Color secondColor,
         double colorMix,
-        double level)
+        double level,
+        double? wavePhase = null,
+        bool reverseWave = false)
     {
         Color color = MixColor(firstColor, secondColor, colorMix, level);
 
@@ -427,7 +458,13 @@ internal static class Program
                 continue;
             if (_traceFirstAnimationFrame)
                 Log($"Testing animation write to {target.Name}.");
-            client.UpdateLeds(target.Id, Enumerable.Repeat(color, target.LedCount).ToArray());
+            Color[] colors = wavePhase.HasValue
+                ? Enumerable.Range(0, target.LedCount)
+                    .Select(index => HueColor(wavePhase.Value +
+                        ((reverseWave ? -1.0 : 1.0) * index / Math.Max(1.0, target.LedCount)), level))
+                    .ToArray()
+                : Enumerable.Repeat(color, target.LedCount).ToArray();
+            client.UpdateLeds(target.Id, colors);
             if (_traceFirstAnimationFrame)
                 Log($"Animation write completed for {target.Name}.");
         }
@@ -483,6 +520,8 @@ internal static class Program
 
             DesiredEffect? profileSeen = null;
             DesiredEffect? headsetApplied = null;
+            Task? chromaApplyTask = null;
+            long chromaApplyStartedAt = 0;
             Color? clientOverride = null;
             while (true)
             {
@@ -493,13 +532,19 @@ internal static class Program
                     if (clientOverride.HasValue)
                         breathingColor = breathingSecondColor = clientOverride.Value;
                     DesiredEffect initial;
+                    SourceModeState sourceMode;
+                    int sourceId;
                     List<(int Id, int LedCount, string Name)> setupTargets;
                     using (var setupClient = new OpenRgbClient(config.Host, config.Port,
                                "OpenRGB Chroma Bridge Setup", false, 1000))
                     {
                         setupClient.Connect();
                         initial = ReadDesiredEffect(setupClient, config);
+                        sourceMode = ReadSourceMode(setupClient, config);
+                        sourceId = FindSourceId(setupClient, config);
                         setupTargets = FindSynchronizedTargets(setupClient, config);
+                        if (config.EnableDeviceBreathing)
+                            EnsureOpenRgbModes(setupClient, config, breathingColor);
                     }
 
                     if (config.FollowSourceColor &&
@@ -507,16 +552,6 @@ internal static class Program
                         (initial.R != 0 || initial.G != 0 || initial.B != 0))
                         breathingColor = new Color(initial.R, initial.G, initial.B);
                     profileSeen = initial;
-
-                    if (config.EnableDeviceBreathing)
-                    {
-                        foreach (var target in setupTargets)
-                        {
-                            string expectedMode = ExpectedOpenRgbMode(target.Name, config);
-                            if (expectedMode.Length > 0)
-                                SetOpenRgbMode(config, target.Name, expectedMode.ToLowerInvariant(), breathingColor);
-                        }
-                    }
 
                     using var client = new OpenRgbClient(config.Host, config.Port,
                         "OpenRGB Chroma Bridge Animation", false, 1000);
@@ -526,11 +561,12 @@ internal static class Program
 
                     var sessionTimer = Stopwatch.StartNew();
                     long nextProfilePoll = 0;
-                    long nextModeCheck = Math.Clamp(config.ProfileCheckMilliseconds, 500, 10000);
+                    long nextSourceModePoll = 0;
                     long nextFrameLog = 0;
                     long nextHeadsetFrame = 0;
+                    long nextClientPoll = 0;
                     Color? lastSentFrame = null;
-                    Color? lastSourceColor = breathingColor;
+                    Color? lastSourceColor = sourceMode.FirstColor;
                     do
                     {
                         long elapsed = sessionTimer.ElapsedMilliseconds;
@@ -539,18 +575,45 @@ internal static class Program
                             chromaReady = true;
                             Log("Razer Chroma connected after delayed initialization; ManO'War synchronization resumed.");
                         }
-                        ClientColorCommand? clientColorChange = DetectClientColorChange(
-                            config, targets, lastSentFrame, lastSourceColor);
+                        if (chromaApplyTask is { IsCompleted: false } &&
+                            Environment.TickCount64 - chromaApplyStartedAt > 5000)
+                        {
+                            Log("Razer Chroma update stalled; exiting so the watchdog can restart the bridge.");
+                            chromaReady = false;
+                            return 4;
+                        }
+                        if (chromaApplyTask is { IsFaulted: true })
+                        {
+                            Log("Razer Chroma update failed: " + chromaApplyTask.Exception?.GetBaseException().Message);
+                            chromaReady = false;
+                            chromaApplyTask = null;
+                        }
+                        ClientColorCommand? clientColorChange = null;
+                        SourceModeState? observedSourceMode = null;
+                        if (elapsed >= nextClientPoll)
+                        {
+                            clientColorChange = DetectClientColorChange(
+                                config, sourceId, lastSentFrame, lastSourceColor,
+                                out observedSourceMode);
+                            nextClientPoll = elapsed + 250;
+                        }
                         if (clientColorChange.HasValue)
                         {
                             lastSourceColor = clientColorChange.Value.Color;
                             if (clientColorChange.Value.ResumeSavedProfile)
                             {
+                                SetOpenRgbMode(config, config.SourceDevice, "direct", ParseColor(config.BreathingColor));
+                                sourceMode = InspectSourceMode(config);
+                                lastSourceColor = sourceMode.FirstColor;
                                 clientOverride = null;
                                 breathingColor = ParseColor(config.BreathingColor);
                                 breathingSecondColor = ParseColor(config.BreathingSecondColor);
                                 sessionTimer.Restart();
                                 elapsed = 0;
+                                nextClientPoll = 0;
+                                nextSourceModePoll = 0;
+                                nextProfilePoll = 0;
+                                nextFrameLog = 0;
                                 nextHeadsetFrame = 0;
                                 headsetApplied = null;
                                 Log($"Saved profile '{config.ProfileName}' selected; synchronized cycle restarted.");
@@ -561,6 +624,34 @@ internal static class Program
                                 breathingColor = breathingSecondColor = clientOverride.Value;
                                 Log($"OpenRGB client color accepted immediately: #{clientOverride.Value.R:X2}{clientOverride.Value.G:X2}{clientOverride.Value.B:X2}.");
                             }
+                        }
+
+                        if (elapsed >= nextSourceModePoll)
+                        {
+                            SourceModeState currentSourceMode = observedSourceMode ?? sourceMode;
+                            if (currentSourceMode != sourceMode)
+                            {
+                                bool effectChanged = !currentSourceMode.Name.Equals(
+                                    sourceMode.Name, StringComparison.OrdinalIgnoreCase) ||
+                                    !currentSourceMode.Name.Equals("Direct", StringComparison.OrdinalIgnoreCase);
+                                sourceMode = currentSourceMode;
+                                if (currentSourceMode.Name.Equals("Direct", StringComparison.OrdinalIgnoreCase))
+                                    lastSourceColor = currentSourceMode.FirstColor;
+                                if (effectChanged)
+                                {
+                                    clientOverride = null;
+                                    sessionTimer.Restart();
+                                    elapsed = 0;
+                                    nextClientPoll = 0;
+                                    nextSourceModePoll = 0;
+                                    nextProfilePoll = 0;
+                                    nextFrameLog = 0;
+                                    nextHeadsetFrame = 0;
+                                    headsetApplied = null;
+                                    Log($"Shared mode <- {sourceMode.Name}, speed {sourceMode.Speed}, brightness {sourceMode.Brightness:P0} from {config.SourceDevice}.");
+                                }
+                            }
+                            nextSourceModePoll = elapsed + Math.Clamp(config.ProfileCheckMilliseconds, 500, 10000);
                         }
 
                         if ((config.FollowSourceColor || !config.EnableDeviceBreathing) &&
@@ -592,50 +683,68 @@ internal static class Program
                             nextProfilePoll = elapsed + Math.Clamp(config.PollMilliseconds, 250, 10000);
                         }
 
-                        if (config.EnableDeviceBreathing && elapsed >= nextModeCheck)
-                        {
-                            SyncClientState clientState = InspectClientState(config, lastSentFrame);
-                            if (clientState.OverrideColor.HasValue)
-                            {
-                                clientOverride = clientState.OverrideColor.Value;
-                                breathingColor = breathingSecondColor = clientOverride.Value;
-                                Log($"OpenRGB client color accepted: #{clientOverride.Value.R:X2}{clientOverride.Value.G:X2}{clientOverride.Value.B:X2}.");
-                            }
-                            if (clientState.ModesChanged)
-                                throw new InvalidOperationException("OpenRGB profile changed; reapplying synchronized modes.");
-                            nextModeCheck = elapsed + Math.Clamp(config.ProfileCheckMilliseconds, 500, 10000);
-                        }
-
                         if (config.EnableDeviceBreathing && targets.Count > 0)
                         {
-                            double period = GetBreathingPeriod(config);
+                            string sharedMode = clientOverride.HasValue ? "Static" : sourceMode.Name;
+                            bool configuredProfile = sharedMode.Equals("Direct", StringComparison.OrdinalIgnoreCase);
+                            bool spectrum = sharedMode.Contains("Spectrum", StringComparison.OrdinalIgnoreCase);
+                            bool wave = sharedMode.Equals("Wave", StringComparison.OrdinalIgnoreCase);
+                            bool off = sharedMode.Equals("Off", StringComparison.OrdinalIgnoreCase);
+                            bool stationary = sharedMode.Equals("Static", StringComparison.OrdinalIgnoreCase) || off;
+                            Color firstColor = clientOverride ?? (configuredProfile
+                                ? ParseColor(config.BreathingColor)
+                                : sourceMode.FirstColor);
+                            Color secondColor = clientOverride ?? (configuredProfile
+                                ? ParseColor(config.BreathingSecondColor)
+                                : sourceMode.SecondColor);
+                            if (off)
+                                firstColor = secondColor = new Color(0, 0, 0);
+                            double period = configuredProfile
+                                ? GetBreathingPeriod(config)
+                                : GetPeriodForSpeed(sourceMode.Speed);
                             double phase = (elapsed % period) / period;
-                            double colorMix = GetColorMix(phase, config.EndpointHoldPercent);
+                            double colorMix = stationary || spectrum || wave
+                                ? 0.0
+                                : GetColorMix(phase, config.EndpointHoldPercent);
                             double minimum = Math.Clamp(config.BreathingMinimumBrightness, 0.0, 0.95);
-                            double level = config.MaintainBrightness
-                                ? 1.0
+                            double modeBrightness = configuredProfile ? 1.0 : sourceMode.Brightness;
+                            double level = config.MaintainBrightness || stationary || spectrum || wave
+                                ? modeBrightness
                                 : minimum + ((1.0 - minimum) * colorMix);
-                            Color frame = UpdateSynchronizedBreathing(client, config, targets, breathingColor,
-                                breathingSecondColor, colorMix, level);
+                            if (spectrum || wave)
+                                firstColor = secondColor = HueColor(phase, 1.0);
+                            Color frame = UpdateSynchronizedBreathing(client, config, targets, firstColor,
+                                secondColor, colorMix, level, wave ? phase : null,
+                                sourceMode.Direction == OpenRGB.NET.Direction.Left);
                             lastSentFrame = frame;
                             if (chromaReady && elapsed >= nextHeadsetFrame)
                             {
                                 double headsetElapsed = elapsed + Math.Clamp(config.HeadsetPhaseLeadMilliseconds, 0, 5000);
                                 double headsetPhase = (headsetElapsed % period) / period;
-                                double headsetMix = GetColorMix(headsetPhase, config.EndpointHoldPercent);
-                                headsetMix = Math.Clamp(headsetMix /
-                                    Math.Clamp(config.HeadsetRedThreshold, 0.1, 1.0), 0.0, 1.0);
-                                Color headsetColor = MixColor(breathingColor, breathingSecondColor, headsetMix);
+                                double headsetMix = stationary || spectrum || wave
+                                    ? 0.0
+                                    : GetColorMix(headsetPhase, config.EndpointHoldPercent);
+                                if (!stationary && !spectrum && !wave)
+                                    headsetMix = Math.Clamp(headsetMix /
+                                        Math.Clamp(config.HeadsetRedThreshold, 0.1, 1.0), 0.0, 1.0);
+                                Color headsetColor = spectrum || wave
+                                    ? HueColor(headsetPhase, modeBrightness)
+                                    : MixColor(firstColor, secondColor, headsetMix, level);
                                 var headsetFrame = new DesiredEffect(HeadsetEffect.Static,
                                     headsetColor.R, headsetColor.G, headsetColor.B);
                                 if (headsetFrame != headsetApplied)
                                 {
-                                    if (_traceFirstAnimationFrame)
-                                        Log("Testing animation write to ManO'War.");
-                                    ChromaNative.Apply(headsetFrame);
-                                    headsetApplied = headsetFrame;
-                                    if (_traceFirstAnimationFrame)
-                                        Log("Animation write completed for ManO'War.");
+                                    if (chromaApplyTask is null || chromaApplyTask.IsCompleted)
+                                    {
+                                        if (_traceFirstAnimationFrame)
+                                            Log("Testing animation write to ManO'War.");
+                                        DesiredEffect effectToApply = headsetFrame;
+                                        chromaApplyStartedAt = Environment.TickCount64;
+                                        chromaApplyTask = Task.Run(() => ChromaNative.Apply(effectToApply));
+                                        headsetApplied = headsetFrame;
+                                        if (_traceFirstAnimationFrame)
+                                            Log("Animation write queued for ManO'War.");
+                                    }
                                 }
                                 nextHeadsetFrame = elapsed + Math.Clamp(config.HeadsetUpdateMilliseconds, 200, 1000);
                             }

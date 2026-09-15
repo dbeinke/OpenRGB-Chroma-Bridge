@@ -22,6 +22,12 @@ the Razer ManO'War. The virtual `Chroma Bridge` controller is included in the sa
 clock. OpenRGB devices use Direct or Static mode so every device follows the same
 phase.
 
+The virtual controller exposes Direct, Static, two-color Breathing, Spectrum Cycle,
+Wave, and Off. Its speed, brightness, colors, and Wave direction are rendered by
+the bridge on one monotonic clock. Physical devices stay in their frame-driven
+Direct or Static transport modes, which prevents their independent hardware clocks
+from drifting apart.
+
 The included active profile is `White to Red - Speed 30`. It slides from full white
 to full red and back at constant brightness. On OpenRGB's 0–100 speed scale, speed
 30 produces an 11-second cycle.
@@ -58,6 +64,12 @@ OpenRGB source device and desired synchronized profile.
 Run `install-virtual-controller.ps1` once to add the one-LED `Chroma Bridge`
 virtual controller to the OpenRGB service configuration. The script requests
 administrator access, backs up `OpenRGB.json`, and restarts the OpenRGB service.
+The shared mode list requires the companion custom OpenRGB build or the included
+`patches/OpenRGB-Chroma-Bridge-modes.patch` applied to OpenRGB 1.0.
+
+This repository also carries a small OpenRGB.NET socket-shutdown patch. It lets the
+bridge poll the virtual master without delaying animation frames when a watcher
+connection closes.
 
 The custom motherboard integration and verified HID report format are covered
 in [EVGA Z590 DARK USB lighting](docs/EVGA-Z590-DARK-USB.md).
@@ -75,13 +87,11 @@ changed in `bridge-config.json`. Saved profile configurations are kept in the
 load the change.
 
 If OpenRGB or Synapse is temporarily unavailable, the bridge waits and reconnects.
-It also watches for OpenRGB client profile changes once per second, restores the
-Direct/Static modes required for synchronization, and reconnects automatically.
-Manual colors selected on the virtual controller are detected before the next
-animation frame and immediately become the synchronized color on every target. The
-same applies to edits on any synchronized physical OpenRGB device. Selecting the saved
-`White to Red - Speed 30` profile clears the manual override and restarts its cycle
-from full white; restarting the bridge does the same.
+It reads the virtual `Chroma Bridge` controller as the master and applies its mode,
+colors, speed, brightness, and direction to every synchronized device. Selecting
+Direct on the master restores the configured `White to Red - Speed 30` profile and
+restarts its cycle from full white. Changes made on individual physical devices can
+be overwritten on the next shared-clock frame.
 
 For startup reliability, register `watchdog.ps1` in the current user's Windows Run
 key. It launches the bridge in the interactive desktop session required by legacy
