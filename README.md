@@ -76,3 +76,11 @@ animation frame and immediately become the synchronized color on every target. T
 same applies to edits on any synchronized OpenRGB device. Selecting the saved
 `White to Red - Speed 30` profile clears the manual override and restarts its cycle
 from full white; restarting the bridge does the same.
+
+For startup reliability, register `watchdog.ps1` in the current user's Windows Run
+key. It launches the bridge in the interactive desktop session required by legacy
+Synapse 2 and restarts it if the process exits or animation logging becomes stale.
+
+The synchronizer is not a Windows service. Its startup entry is named
+`OpenRGB Chroma Bridge`. The related Windows services are `OpenRGB`,
+`Razer Chroma SDK Service`, and `Razer Chroma SDK Server`.

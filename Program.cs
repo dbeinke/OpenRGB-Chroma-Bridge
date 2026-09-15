@@ -433,11 +433,26 @@ internal static class Program
         catch (Exception ex) { Log("Configuration error: " + ex.Message); return 2; }
 
         bool chromaReady = false;
+        Task chromaInitialization = Task.Run(ChromaNative.Initialize);
         try
         {
-            ChromaNative.Initialize();
-            chromaReady = true;
-            Log("Razer Chroma connected.");
+            try
+            {
+                if (chromaInitialization.Wait(TimeSpan.FromSeconds(5)))
+                {
+                    chromaInitialization.GetAwaiter().GetResult();
+                    chromaReady = true;
+                    Log("Razer Chroma connected.");
+                }
+                else
+                {
+                    Log("Razer Chroma initialization timed out; OpenRGB animation will continue while Chroma connects.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("Razer Chroma unavailable; OpenRGB animation will continue: " + ex.GetBaseException().Message);
+            }
 
             DesiredEffect? profileSeen = null;
             DesiredEffect? headsetApplied = null;
@@ -494,6 +509,11 @@ internal static class Program
                     do
                     {
                         long elapsed = sessionTimer.ElapsedMilliseconds;
+                        if (!chromaReady && chromaInitialization.IsCompletedSuccessfully)
+                        {
+                            chromaReady = true;
+                            Log("Razer Chroma connected after delayed initialization; ManO'War synchronization resumed.");
+                        }
                         ClientColorCommand? clientColorChange = DetectClientColorChange(config, targets, lastSentFrame);
                         if (clientColorChange.HasValue)
                         {
@@ -534,9 +554,12 @@ internal static class Program
 
                                 if (!config.EnableDeviceBreathing)
                                 {
-                                    ChromaNative.Apply(desired);
-                                    headsetApplied = desired;
-                                    Log($"ManO'War <- {desired} from {config.SourceDevice}.");
+                                    if (chromaReady)
+                                    {
+                                        ChromaNative.Apply(desired);
+                                        headsetApplied = desired;
+                                        Log($"ManO'War <- {desired} from {config.SourceDevice}.");
+                                    }
                                 }
                             }
                             nextProfilePoll = elapsed + Math.Clamp(config.PollMilliseconds, 250, 10000);
@@ -568,7 +591,7 @@ internal static class Program
                             Color frame = UpdateSynchronizedBreathing(client, targets, breathingColor,
                                 breathingSecondColor, colorMix, level);
                             lastSentFrame = frame;
-                            if (elapsed >= nextHeadsetFrame)
+                            if (chromaReady && elapsed >= nextHeadsetFrame)
                             {
                                 double headsetElapsed = elapsed + Math.Clamp(config.HeadsetPhaseLeadMilliseconds, 0, 5000);
                                 double headsetPhase = (headsetElapsed % period) / period;
