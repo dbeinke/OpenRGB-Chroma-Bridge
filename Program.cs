@@ -26,6 +26,7 @@ internal sealed class BridgeConfig
     public int HeadsetPhaseLeadMilliseconds { get; set; } = 700;
     public double HeadsetRedThreshold { get; set; } = 0.65;
     public int ProfileCheckMilliseconds { get; set; } = 1000;
+    public bool EnableLogitechLighting { get; set; } = true;
 }
 
 internal enum HeadsetEffect
@@ -153,12 +154,13 @@ internal static class Program
     private static readonly string LogPath = Path.Combine(LogDirectory, "bridge.log");
     private static bool _console;
     private static bool _traceFirstAnimationFrame = true;
+    private static readonly object LogLock = new();
 
     private static void Log(string message)
     {
         Directory.CreateDirectory(LogDirectory);
         string line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {message}";
-        File.AppendAllText(LogPath, line + Environment.NewLine);
+        lock (LogLock) File.AppendAllText(LogPath, line + Environment.NewLine);
         if (_console)
             Console.WriteLine(line);
     }
@@ -496,6 +498,7 @@ internal static class Program
         try { config = LoadConfig(); }
         catch (Exception ex) { Log("Configuration error: " + ex.Message); return 2; }
 
+        using var logitech = config.EnableLogitechLighting ? new LogitechLighting(Log) : null;
         bool chromaReady = false;
         Task chromaInitialization = Task.Run(ChromaNative.Initialize);
         try
@@ -570,6 +573,12 @@ internal static class Program
                     do
                     {
                         long elapsed = sessionTimer.ElapsedMilliseconds;
+                        if (!config.EnableDeviceBreathing)
+                        {
+                            var current = ReadDesiredEffect(client, config);
+                            logitech?.Update(current.Effect == HeadsetEffect.None
+                                ? new Color(0, 0, 0) : new Color(current.R, current.G, current.B));
+                        }
                         if (!chromaReady && chromaInitialization.IsCompletedSuccessfully)
                         {
                             chromaReady = true;
@@ -717,6 +726,7 @@ internal static class Program
                                 secondColor, colorMix, level, wave ? phase : null,
                                 sourceMode.Direction == OpenRGB.NET.Direction.Left);
                             lastSentFrame = frame;
+                            logitech?.Update(frame);
                             if (chromaReady && elapsed >= nextHeadsetFrame)
                             {
                                 double headsetElapsed = elapsed + Math.Clamp(config.HeadsetPhaseLeadMilliseconds, 0, 5000);

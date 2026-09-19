@@ -1,5 +1,25 @@
 # OpenRGB Chroma Bridge
 
+## Logitech G19 lighting
+
+The bridge sends each shared animation frame directly to the G19's USB HID
+lighting interface (046D:C229, interface 1, vendor usage page FF00). Its feature
+report is four bytes: 07, red, green, blue. Logitech Gaming Software can remain
+installed for macros and the LCD; lighting no longer depends on its LED SDK.
+
+`EnableLogitechLighting` defaults to `true`; set it to `false` to disable this
+output. The G19 follows the shared color, brightness, and Off mode without the
+ManO'War-specific timing compensation. Wave is represented by one color across
+the G19, since it has no per-key RGB. Only the matching G19 HID device is targeted.
+
+USB writes run on a dedicated background thread with the latest frame only.
+Disconnect/write failures retry every five seconds without stopping OpenRGB or
+Razer lighting. Every 30 seconds, the log compares the sent color with the
+keyboard's feature-report readback. Writes repeat while a static color is selected
+to recover from Logitech profile changes. No driver replacement is required.
+
+Validated on a physical G19 with white, red, off, and mixed-color hardware readback, plus confirmed synchronization with the PC lighting. Protocol reference: [G19 driver submission](https://lkml.rescloud.iu.edu/hypermail/linux/kernel/1502.2/03681.html).
+
 A Windows background bridge that keeps OpenRGB devices and a legacy Razer
 ManO'War synchronized through the Razer Chroma SDK.
 
