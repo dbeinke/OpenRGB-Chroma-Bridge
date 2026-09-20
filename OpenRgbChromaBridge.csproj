@@ -25,4 +25,9 @@
     <None Include="install-virtual-controller.ps1" CopyToOutputDirectory="PreserveNewest" />
     <None Include="patches\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+  <ItemGroup>
+    <Compile Remove="G19Dashboard\**\*.cs" />
+    <EmbeddedResource Remove="G19Dashboard\**\*" />
+    <None Remove="G19Dashboard\**\*" />
+  </ItemGroup>
 </Project>

@@ -1,5 +1,18 @@
 # OpenRGB Chroma Bridge
 
+## G19 LCD dashboard
+
+The [G19 System Dashboard](G19Dashboard/README.md) is a separate companion app for
+the keyboard's 320x240 LCD. It shows CPU temperature, clock and load; NVIDIA GPU
+temperature, core/memory clocks and load; and network upload/download rates.
+Bright statistics are drawn over the included custom Darkness background.
+
+The display refreshes once per second using Core Temp shared memory, NVIDIA NVML,
+and Windows network counters. The LCD uses Logitech Gaming Software's LCD SDK;
+the RGB backlight continues through the existing direct USB bridge.
+
+![G19 dashboard with custom background](G19Dashboard/preview.png)
+
 ## Logitech G19 lighting
 
 The bridge sends each shared animation frame directly to the G19's USB HID
