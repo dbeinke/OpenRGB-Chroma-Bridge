@@ -3,6 +3,6 @@
 <ItemGroup>
 <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0"/><PackageReference Include="xunit" Version="2.9.3"/><PackageReference Include="xunit.runner.visualstudio" Version="2.8.2"/>
 <ProjectReference Include="../vendor/G19USB/G19USB.csproj"/>
-<Compile Include="../Lcd.cs" Link="Lcd.cs"/><Compile Include="../Renderer.cs" Link="Renderer.cs"/><Compile Include="../Sensors.cs" Link="Sensors.cs"/>
+<Compile Include="../LightingServer.cs" Link="LightingServer.cs"/><Compile Include="../Lcd.cs" Link="Lcd.cs"/><Compile Include="../Renderer.cs" Link="Renderer.cs"/><Compile Include="../Sensors.cs" Link="Sensors.cs"/>
 <None Include="../background.png" Link="background.png" CopyToOutputDirectory="PreserveNewest"/>
 </ItemGroup></Project>

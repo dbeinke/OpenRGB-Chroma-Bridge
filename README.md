@@ -15,25 +15,20 @@ See the dashboard guide for driver setup, rollback, tests, and hardware validati
 
 ## Logitech G19 lighting
 
-**Driver compatibility:** The HID lighting backend below requires the original Windows composite/HID driver. The dashboard's libusbK composite-parent replacement removes that HID path. G19 RGB synchronization through this backend is therefore unavailable in direct-USB LCD mode; a shared USB lighting integration is not implemented. Other bridge lighting targets are unchanged.
+The dashboard owns the G19 libusbK USB handle for both LCD frames and RGB control.
+The bridge sends its latest animation color over a same-user local named pipe;
+the dashboard applies feature report 07 without color correction and returns
+hardware RGB readback. Every reply is checked against the requested color.
+This preserves Off, Static, Breathing, and Spectrum colors from the shared clock.
 
-The bridge sends each shared animation frame directly to the G19's USB HID
-lighting interface (046D:C229, interface 1, vendor usage page FF00). Its feature
-report is four bytes: 07, red, green, blue. Logitech Gaming Software can remain
-installed for macros and the LCD; lighting no longer depends on its LED SDK.
+`EnableLogitechLighting` controls this output. Run both the dashboard and bridge
+under the same Windows user. Both watchdogs remain required. If the dashboard is
+unavailable, G19 lighting retries every five seconds while other lighting continues.
+The pipe replaces the previous HID backend and requires the libusbK dashboard.
+No additional driver change is needed. G-keys/macros are outside this integration.
 
-`EnableLogitechLighting` defaults to `true`; set it to `false` to disable this
-output. The G19 follows the shared color, brightness, and Off mode without the
-ManO'War-specific timing compensation. Wave is represented by one color across
-the G19, since it has no per-key RGB. Only the matching G19 HID device is targeted.
-
-USB writes run on a dedicated background thread with the latest frame only.
-Disconnect/write failures retry every five seconds without stopping OpenRGB or
-Razer lighting. Every 30 seconds, the log compares the sent color with the
-keyboard's feature-report readback. Writes repeat while a static color is selected
-to recover from Logitech profile changes. No driver replacement is required.
-
-Validated on a physical G19 with white, red, off, and mixed-color hardware readback, plus confirmed synchronization with the PC lighting. Protocol reference: [G19 driver submission](https://lkml.rescloud.iu.edu/hypermail/linux/kernel/1502.2/03681.html).
+Physical validation: LCD writes and RGB hardware readback succeeded together on
+a G19. The bridge logs shared USB frame counts and readback matches every 30 seconds.
 
 A Windows background bridge that keeps OpenRGB devices and a legacy Razer
 ManO'War synchronized through the Razer Chroma SDK.

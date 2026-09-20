@@ -587,6 +587,25 @@ namespace G19USB
         /// </remarks>
         /// <exception cref="InvalidOperationException">The LCD endpoint is not open.</exception>
         /// <exception cref="ObjectDisposedException">This instance has already been disposed.</exception>
+        /// <summary>Write unmodified RGB using feature report 7 and return hardware readback.</summary>
+        public byte[] SetBacklightExact(byte red, byte green, byte blue)
+        {
+            lock (_deviceLock)
+            {
+                ThrowIfDisposed();
+                if (_usbDevice == null || !IsAvailable) throw new InvalidOperationException("USB not open.");
+                byte[] report = { 7, red, green, blue };
+                var set = new UsbSetupPacket(0x21, 0x09, 0x0307, 1, 4);
+                if (!_usbDevice.ControlTransfer(ref set, report, 4, out int sent) || sent != 4)
+                    throw new System.IO.IOException("G19 RGB write failed.");
+                byte[] actual = { 7, 0, 0, 0 };
+                var get = new UsbSetupPacket(0xA1, 0x01, 0x0307, 1, 4);
+                if (!_usbDevice.ControlTransfer(ref get, actual, 4, out int received) || received != 4 || actual[0] != 7)
+                    throw new System.IO.IOException("G19 RGB readback failed.");
+                return new byte[] { actual[1], actual[2], actual[3] };
+            }
+        }
+        /// <summary>Set backlight with the original upstream white correction.</summary>
         public void SetBacklightColor(byte red, byte green, byte blue)
         {
             ThrowIfDisposed();

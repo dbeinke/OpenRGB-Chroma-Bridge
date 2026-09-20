@@ -30,6 +30,7 @@ internal static class Program
   }
   bool ready=false;DateTime nextConnect=DateTime.MinValue,nextLog=DateTime.MinValue;
   using var lcd=new DirectUsbLcd();
+  using var lighting=new LightingServer(lcd.SetLighting);
   try
   {
    Log("Dashboard started.");
