@@ -30,6 +30,18 @@ No additional driver change is needed. G-keys/macros are outside this integratio
 Physical validation: LCD writes and RGB hardware readback succeeded together on
 a G19. The bridge logs shared USB frame counts and readback matches every 30 seconds.
 
+## ManO'War direct integration
+
+The bridge now performs a read-only startup probe of the ManO'War receiver's
+vendor HID collection (`1532:0A02`, interface 3). On the validated receiver it
+reports 64-byte input, output, and feature reports, matching the available
+lighting and button captures. This leaves the USB audio interface and its
+standard Windows driver untouched.
+
+Direct ManO'War lighting and button support is in development. Until it has
+passed physical tests, the bridge continues using the existing Razer Chroma SDK
+path; Synapse 2 and the Chroma SDK must remain installed and running.
+
 A Windows background bridge that keeps OpenRGB devices and a legacy Razer
 ManO'War synchronized through the Razer Chroma SDK.
 

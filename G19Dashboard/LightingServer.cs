@@ -3,16 +3,18 @@ using System.IO.Pipes;
 // One local, same-user client; requests and replies are exactly three RGB bytes.
 internal sealed class LightingServer : IDisposable
 {
+ private readonly string pipeName;
  private readonly CancellationTokenSource stop=new();
  private readonly Task worker;
- public LightingServer(Func<byte[],byte[]> apply)
+ public LightingServer(Func<byte[],byte[]> apply, string pipeName="G19Dashboard.Lighting.v1")
  {
+  this.pipeName=pipeName;
   worker=Task.Run(async ()=> {
    while(!stop.IsCancellationRequested)
    {
     try
     {
-     using var pipe=new NamedPipeServerStream("G19Dashboard.Lighting.v1",PipeDirection.InOut,1,PipeTransmissionMode.Byte,PipeOptions.Asynchronous|PipeOptions.CurrentUserOnly);
+     using var pipe=new NamedPipeServerStream(this.pipeName,PipeDirection.InOut,1,PipeTransmissionMode.Byte,PipeOptions.Asynchronous|PipeOptions.CurrentUserOnly);
      await pipe.WaitForConnectionAsync(stop.Token);
      var rgb=new byte[3];
      while(!stop.IsCancellationRequested)

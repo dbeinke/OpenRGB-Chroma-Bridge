@@ -499,6 +499,17 @@ internal static class Program
         catch (Exception ex) { Log("Configuration error: " + ex.Message); return 2; }
 
         using var logitech = config.EnableLogitechLighting ? new LogitechLighting(Log) : null;
+        try
+        {
+            var manowar = ManowarDiscovery.FindVendorCollection();
+            Log(manowar is null
+                ? "ManO'War direct probe: vendor HID collection unavailable."
+                : $"ManO'War direct probe: vendor HID found; input={manowar.Value.InputBytes}, output={manowar.Value.OutputBytes}, feature={manowar.Value.FeatureBytes} bytes.");
+        }
+        catch (Exception ex)
+        {
+            Log("ManO'War direct probe failed: " + ex.Message);
+        }
         bool chromaReady = false;
         Task chromaInitialization = Task.Run(ChromaNative.Initialize);
         try
