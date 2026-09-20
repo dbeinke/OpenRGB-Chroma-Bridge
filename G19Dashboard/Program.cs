@@ -1,5 +1,5 @@
 using System.Drawing.Imaging;
-using System.Runtime.InteropServices;
+
 using System.Text.Json;
 
 internal sealed class Config
@@ -9,7 +9,6 @@ internal sealed class Config
 }
 internal static class Program
 {
- [DllImport("kernel32.dll",CharSet=CharSet.Unicode)] private static extern bool SetDllDirectory(string path);
  private static readonly string DataPath=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"G19 Dashboard");
  private static void Log(string text){Directory.CreateDirectory(DataPath);File.AppendAllText(Path.Combine(DataPath,"dashboard.log"),$"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {text}\n");}
  [STAThread] private static int Main(string[] args)
@@ -30,7 +29,7 @@ internal static class Program
    return 0;
   }
   bool ready=false;DateTime nextConnect=DateTime.MinValue,nextLog=DateTime.MinValue;
-  SetDllDirectory(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),"Logitech Gaming Software","SDK","LCD","x64"));
+  using var lcd=new DirectUsbLcd();
   try
   {
    Log("Dashboard started.");
@@ -41,18 +40,10 @@ internal static class Program
     try
     {
      if(!ready&&DateTime.UtcNow>=nextConnect)
-     {ready=LcdProbe.LogiLcdInit("G19 System Dashboard",2);nextConnect=DateTime.UtcNow.AddSeconds(5);Log("LCD initialize: "+ready);}
-     if(ready&&LcdProbe.LogiLcdIsConnected(2))
-     {
-      var data=bitmap.LockBits(new Rectangle(0,0,320,240),ImageLockMode.ReadOnly,PixelFormat.Format32bppArgb);
-      byte[] pixels=new byte[320*240*4];
-      try {Marshal.Copy(data.Scan0,pixels,0,pixels.Length);}finally{bitmap.UnlockBits(data);}
-      if(!LcdNative.LogiLcdColorSetBackground(pixels))throw new IOException("LCD rejected frame");
-      LcdProbe.LogiLcdUpdate();
-     }
-     else if(ready){LcdProbe.LogiLcdShutdown();ready=false;Log("LCD disconnected; retrying.");}
+     {lcd.Open();ready=true;Log("LCD direct USB initialized.");}
+     if(ready)lcd.Show(bitmap);
     }
-    catch(Exception ex){Log("LCD: "+ex.Message);try{LcdProbe.LogiLcdShutdown();}catch{} ready=false;nextConnect=DateTime.UtcNow.AddSeconds(5);}
+    catch(Exception ex){Log("LCD: "+ex.Message);try{lcd.Close();}catch(Exception closeEx){Log("LCD close: "+closeEx.Message);} ready=false;nextConnect=DateTime.UtcNow.AddSeconds(5);}
     if(DateTime.UtcNow>=nextLog)
     {
      File.WriteAllText(Path.Combine(DataPath,"metrics.json"),JsonSerializer.Serialize(metrics,new JsonSerializerOptions{WriteIndented=true}));
@@ -64,11 +55,6 @@ internal static class Program
    }
   }
   catch(Exception ex){Log("Stopped: "+ex);return 1;}
-  finally{if(ready)LcdProbe.LogiLcdShutdown();}
+  finally{lcd.Close();}
  }
-}
-internal static class LcdNative
-{
- [DllImport(@"C:\Program Files\Logitech Gaming Software\SDK\LCD\x64\LogitechLcd.dll",CallingConvention=CallingConvention.Cdecl)]
- [return:MarshalAs(UnmanagedType.I1)]internal static extern bool LogiLcdColorSetBackground(byte[] bytes);
 }

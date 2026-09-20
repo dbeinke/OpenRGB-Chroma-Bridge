@@ -1,0 +1,868 @@
+using LibUsbDotNet;
+using LibUsbDotNet.Main;
+using System;
+using System.Buffers;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace G19USB
+{
+    /// <summary>
+    /// Low-level LCD and backlight interface for the G19 display transport.
+    /// Based on libg19: https://github.com/jgeboski/libg19
+    /// </summary>
+    /// <remarks>
+    /// This type manages USB interface 0 and the LCD bulk-out endpoint. Use <see cref="G19Device"/> when the LCD and
+    /// keyboard should share one USB handle; use <see cref="LCD"/> directly when you only need the screen and backlight.
+    /// </remarks>
+    public class LCD : IDisposable
+    {
+        private UsbDevice? _usbDevice;
+        private IUsbDevice? _wholeUsbDevice;
+        private UsbDeviceFinder _usbFinder;
+
+        private UsbEndpointWriter? _writer;
+        // Synchronize connect/disconnect/write operations
+        private readonly object _deviceLock = new object();
+        // Reconnect attempts when writes fail (useful after sleep/resume)
+        private const int DefaultReconnectAttempts = 3;
+        private const int DefaultReconnectDelayMs = 500;
+        private const int OrderedWriteQueueCapacity = 2;
+        private readonly byte[] _lcdBuffer = new byte[G19Constants.LcdFullSize];
+        private readonly GCHandle _lcdBufferHandle;
+        private int _lcdBufferInFlight;
+        private readonly ArrayPool<byte> _framePool = ArrayPool<byte>.Shared;
+        private readonly LcdWriteQueue<PendingWrite> _writeQueue;
+        private readonly CancellationTokenSource _writeCts;
+        private readonly Task _writeWorker;
+        private bool _disposed;
+
+        /// <summary>
+        /// Gets whether the LCD endpoint has been opened successfully.
+        /// </summary>
+        /// <remarks>
+        /// This flag is updated when the endpoint writer is created or torn down. It does not actively probe USB
+        /// connectivity, so it may remain <see langword="true"/> until a later operation notices a failure.
+        /// </remarks>
+        public bool IsAvailable { get; private set; }
+
+        /// <summary>
+        /// Creates an LCD helper that targets the default Logitech G19 vendor and product IDs.
+        /// </summary>
+        public LCD() : this(G19Constants.VendorId, G19Constants.ProductId) { }
+
+        /// <summary>
+        /// Creates an LCD helper for the specified USB vendor and product IDs.
+        /// </summary>
+        /// <param name="vendorId">USB vendor ID to probe.</param>
+        /// <param name="productId">USB product ID to probe.</param>
+        public LCD(int vendorId, int productId)
+        {
+            _usbFinder = new UsbDeviceFinder(vendorId, productId);
+            _lcdBufferHandle = GCHandle.Alloc(_lcdBuffer, GCHandleType.Pinned);
+            _writeQueue = new LcdWriteQueue<PendingWrite>(OrderedWriteQueueCapacity);
+            _writeCts = new CancellationTokenSource();
+            _writeWorker = Task.Factory.StartNew(
+                () => ProcessWriteQueue(_writeCts.Token),
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+            // Pre-initialize buffer with header
+            Array.Copy(G19Constants.LcdHeader, _lcdBuffer, G19Constants.LcdHeaderSize);
+        }
+
+        /// <summary>
+        /// Opens USB interface 0 and the LCD bulk-out endpoint.
+        /// </summary>
+        /// <remarks>
+        /// Calling this method more than once is safe; subsequent calls return immediately while the LCD is already open.
+        /// If the device is visible to LibUsbDotNet but cannot be opened, the thrown <see cref="Exception"/> typically
+        /// indicates that another application owns it or that libusbK is not installed on the composite parent device for
+        /// the LCD path.
+        /// </remarks>
+        /// <exception cref="ObjectDisposedException">This instance has already been disposed.</exception>
+        /// <exception cref="Exception">The device or LCD endpoint could not be opened.</exception>
+        public void OpenDevice()
+        {
+            ThrowIfDisposed();
+
+            if (IsAvailable)
+                return;
+
+            _usbDevice = UsbDevice.OpenUsbDevice(_usbFinder);
+
+            if (_usbDevice == null)
+            {
+                // Try to find the device in AllDevices for better error reporting
+                bool deviceExists = false;
+                foreach (LibUsbDotNet.Main.UsbRegistry reg in UsbDevice.AllDevices)
+                {
+                    if (reg.Vid == G19Constants.VendorId && reg.Pid == G19Constants.ProductId)
+                    {
+                        deviceExists = true;
+                        break;
+                    }
+                }
+
+                if (deviceExists)
+                {
+                    throw new Exception("G19 device found but could not be opened. This may happen if:\n" +
+                        "1. The device is already in use by another application\n" +
+                        "2. The libusbK driver is not installed correctly on the composite parent device\n" +
+                        "3. You need to reinstall the libusbK driver using Zadig on the base device (not just interface 0)");
+                }
+                else
+                {
+                    throw new Exception("G19 LCD device not found. Please check USB connection and drivers.");
+                }
+            }
+
+            _wholeUsbDevice = _usbDevice as IUsbDevice;
+
+            if (_wholeUsbDevice != null)
+            {
+                // Set configuration and claim the LCD interface (interface #0)
+                _wholeUsbDevice.SetConfiguration(G19Constants.UsbConfiguration);
+                _wholeUsbDevice.ClaimInterface(G19Constants.UsbInterfaceLcd);
+            }
+
+            // Open bulk endpoint for LCD output (endpoint 0x02)
+            _writer = _usbDevice.OpenEndpointWriter((WriteEndpointID)G19Constants.EndpointLcdOut);
+
+            IsAvailable = _writer != null;
+
+            if (!IsAvailable)
+            {
+                CloseDevice();
+                throw new Exception("Failed to open LCD output endpoint.");
+            }
+        }
+
+        /// <summary>
+        /// Initialize LCD with a shared USB device (for use with G19Device)
+        /// </summary>
+        internal void InitializeWithSharedDevice(UsbDevice sharedDevice, IUsbDevice? wholeDevice)
+        {
+            ThrowIfDisposed();
+
+            if (IsAvailable)
+                return;
+
+            _usbDevice = sharedDevice;
+            _wholeUsbDevice = wholeDevice;
+
+            // Open bulk endpoint for LCD output (endpoint 0x02)
+            _writer = _usbDevice.OpenEndpointWriter((WriteEndpointID)G19Constants.EndpointLcdOut);
+
+            IsAvailable = _writer != null;
+
+            if (!IsAvailable)
+            {
+                throw new Exception("Failed to open LCD output endpoint.");
+            }
+        }
+
+        /// <summary>
+        /// Close only the endpoints, not the device (for shared device mode)
+        /// </summary>
+        internal void CloseEndpoints()
+        {
+            ThrowIfDisposed();
+
+            _writer?.Dispose();
+            _writer = null;
+            IsAvailable = false;
+        }
+
+        /// <summary>
+        /// Closes the LCD endpoint and, when this instance owns the USB handle, releases interface 0 and closes the device.
+        /// </summary>
+        /// <remarks>
+        /// If this <see cref="LCD"/> instance was initialized from <see cref="G19Device"/>, calling this method also
+        /// closes the shared USB handle and therefore affects the keyboard side. Prefer <see cref="G19Device.CloseDevice"/>
+        /// when you obtained the helper from the combined wrapper.
+        /// </remarks>
+        public void CloseDevice()
+        {
+            _writer?.Dispose();
+            _writer = null;
+
+            if (_usbDevice != null)
+            {
+                if (_usbDevice.IsOpen)
+                {
+                    if (_wholeUsbDevice != null)
+                    {
+                        _wholeUsbDevice.ReleaseInterface(G19Constants.UsbInterfaceLcd);
+                    }
+                    _usbDevice.Close();
+                }
+                (_usbDevice as IDisposable)?.Dispose();
+                _usbDevice = null;
+                UsbDevice.Exit();
+            }
+
+            IsAvailable = false;
+        }
+
+        /// <summary>
+        /// Writes one LCD frame and waits for the queued USB transfer to finish.
+        /// </summary>
+        /// <param name="lcdData">
+        /// Either <see cref="G19Constants.LcdDataSize"/> bytes of raw RGB565 pixel payload, such as the output of
+        /// <see cref="G19Helpers.ConvertBitmapToRGB565(System.Drawing.Bitmap)"/>, or
+        /// <see cref="G19Constants.LcdFullSize"/> bytes containing <see cref="G19Constants.LcdHeader"/> followed by
+        /// that payload.
+        /// </param>
+        /// <remarks>
+        /// This overload validates only the buffer length. Callers are responsible for supplying the device's RGB565 byte
+        /// order and frame layout.
+        /// </remarks>
+        /// <exception cref="ArgumentNullException"><paramref name="lcdData"/> is <see langword="null"/>.</exception>
+        /// <exception cref="ArgumentException"><paramref name="lcdData"/> does not match a supported frame size.</exception>
+        /// <exception cref="InvalidOperationException">The LCD endpoint is not open.</exception>
+        /// <exception cref="ObjectDisposedException">This instance has already been disposed.</exception>
+        public void UpdateScreen(byte[] lcdData)
+        {
+            if (lcdData == null)
+            {
+                throw new ArgumentNullException(nameof(lcdData));
+            }
+
+            UpdateScreenAsync(lcdData, lcdData.Length == G19Constants.LcdFullSize).GetAwaiter().GetResult();
+        }
+
+        /// <summary>
+        /// Writes one complete header-plus-payload LCD frame without copying it into the LCD's
+        /// internal frame buffer. This call remains synchronous and does not return until the
+        /// worker has finished with the caller-owned array.
+        /// </summary>
+        /// <param name="lcdFrame">Exactly <see cref="G19Constants.LcdFullSize"/> bytes.</param>
+        /// <remarks>
+        /// The array must not be modified until this method returns. The complete frame must
+        /// contain the protocol header followed by the 153600-byte RGB565 payload.
+        /// </remarks>
+        public void UpdateScreenCompleteFrame(byte[] lcdFrame)
+        {
+            if (lcdFrame == null)
+                throw new ArgumentNullException(nameof(lcdFrame));
+
+            UpdateScreenAsync(lcdFrame, includesHeader: true).GetAwaiter().GetResult();
+        }
+
+        /// <summary>
+        /// Queues a latest-frame update. At most one not-yet-started frame is retained; a newer
+        /// call completes the older pending call with <see cref="LcdFrameSupersededException"/>.
+        /// </summary>
+        /// <param name="lcdData">Raw RGB565 payload or a complete frame, according to <paramref name="includesHeader"/>.</param>
+        /// <param name="includesHeader">Whether <paramref name="lcdData"/> includes the 512-byte protocol header.</param>
+        /// <remarks>
+        /// Raw payload memory is copied before this method returns. Array-backed complete-frame
+        /// memory is retained until the returned task completes, so callers must keep it alive and
+        /// unchanged until completion. Use the synchronous complete-frame method when every frame
+        /// must be delivered and caller-thread error reporting is required.
+        /// </remarks>
+        public ValueTask UpdateScreenLatestAsync(
+            ReadOnlyMemory<byte> lcdData,
+            bool includesHeader = false)
+        {
+            ThrowIfDisposed();
+
+            if (!IsAvailable)
+                throw new InvalidOperationException("Device must be opened before updating screen.");
+            if (lcdData.IsEmpty)
+                throw new ArgumentNullException(nameof(lcdData));
+
+            if (includesHeader)
+            {
+                if (lcdData.Length != G19Constants.LcdFullSize)
+                {
+                    throw new ArgumentException(
+                        $"LCD data must be exactly {G19Constants.LcdFullSize} bytes when the header is included.",
+                        nameof(lcdData));
+                }
+
+                return QueueFullFrameLatestAsync(lcdData);
+            }
+
+            if (lcdData.Length != G19Constants.LcdDataSize)
+            {
+                throw new ArgumentException(
+                    $"LCD data must be exactly {G19Constants.LcdDataSize} bytes (320x240 RGB565) when no header is supplied.",
+                    nameof(lcdData));
+            }
+
+            return QueueRawPixelsLatestAsync(lcdData.Span);
+        }
+
+        /// <summary>
+        /// Writes one complete frame through the bounded latest-frame path.
+        /// </summary>
+        public ValueTask UpdateScreenCompleteFrameLatestAsync(ReadOnlyMemory<byte> lcdFrame)
+            => UpdateScreenLatestAsync(lcdFrame, includesHeader: true);
+
+        /// <summary>
+        /// Writes one LCD frame from raw RGB565 pixel data.
+        /// </summary>
+        /// <param name="lcdData">
+        /// Exactly <see cref="G19Constants.LcdDataSize"/> bytes of raw RGB565 pixel payload without the 512-byte header.
+        /// </param>
+        /// <remarks>
+        /// The span is copied into an internal full-frame buffer before the call returns. Use
+        /// <see cref="UpdateScreenAsync(ReadOnlyMemory{byte}, bool)"/> with <paramref name="lcdData"/> plus a header when
+        /// you already have a complete frame.
+        /// </remarks>
+        /// <exception cref="ArgumentException"><paramref name="lcdData"/> does not contain exactly one raw frame.</exception>
+        /// <exception cref="InvalidOperationException">The LCD endpoint is not open.</exception>
+        /// <exception cref="ObjectDisposedException">This instance has already been disposed.</exception>
+        public void UpdateScreen(ReadOnlySpan<byte> lcdData)
+        {
+            ThrowIfDisposed();
+
+            if (!IsAvailable)
+            {
+                throw new InvalidOperationException("Device must be opened before updating screen.");
+            }
+
+            if (lcdData.Length != G19Constants.LcdDataSize)
+            {
+                throw new ArgumentException($"LCD data must be exactly {G19Constants.LcdDataSize} bytes (320x240 RGB565).", nameof(lcdData));
+            }
+
+            QueueRawPixelsAsync(lcdData).GetAwaiter().GetResult();
+        }
+
+        /// <summary>
+        /// Queues one LCD frame and returns a task that completes when the USB write finishes.
+        /// </summary>
+        /// <param name="lcdData">Raw RGB565 pixel payload or a complete header-plus-pixel frame, depending on <paramref name="includesHeader"/>.</param>
+        /// <param name="includesHeader">
+        /// <see langword="true"/> when <paramref name="lcdData"/> already includes <see cref="G19Constants.LcdHeader"/>;
+        /// otherwise <see langword="false"/>.
+        /// </param>
+        /// <remarks>
+        /// Writes are serialized on an internal worker. When <paramref name="includesHeader"/> is
+        /// <see langword="false"/>, <paramref name="lcdData"/> must contain exactly
+        /// <see cref="G19Constants.LcdDataSize"/> bytes and the payload is copied before this method returns. When it is
+        /// <see langword="true"/>, <paramref name="lcdData"/> must contain exactly
+        /// <see cref="G19Constants.LcdFullSize"/> bytes. Array-backed memory of that exact size may be written directly,
+        /// so keep it alive and unchanged until the returned task completes.
+        /// </remarks>
+        /// <exception cref="ArgumentNullException"><paramref name="lcdData"/> is empty.</exception>
+        /// <exception cref="ArgumentException"><paramref name="lcdData"/> does not match the expected frame size.</exception>
+        /// <exception cref="InvalidOperationException">The LCD endpoint is not open.</exception>
+        /// <exception cref="ObjectDisposedException">This instance has already been disposed.</exception>
+        public ValueTask UpdateScreenAsync(ReadOnlyMemory<byte> lcdData, bool includesHeader = false)
+        {
+            ThrowIfDisposed();
+
+            if (!IsAvailable)
+            {
+                throw new InvalidOperationException("Device must be opened before updating screen.");
+            }
+
+            if (lcdData.IsEmpty)
+            {
+                throw new ArgumentNullException(nameof(lcdData));
+            }
+
+            if (includesHeader)
+            {
+                if (lcdData.Length != G19Constants.LcdFullSize)
+                {
+                    throw new ArgumentException($"LCD data must be exactly {G19Constants.LcdFullSize} bytes when the header is included.", nameof(lcdData));
+                }
+
+                return QueueFullFrameAsync(lcdData);
+            }
+
+            if (lcdData.Length != G19Constants.LcdDataSize)
+            {
+                throw new ArgumentException($"LCD data must be exactly {G19Constants.LcdDataSize} bytes (320x240 RGB565) when no header is supplied.", nameof(lcdData));
+            }
+
+            return QueueRawPixelsAsync(lcdData.Span);
+        }
+
+        private ValueTask QueueRawPixelsAsync(ReadOnlySpan<byte> pixelData)
+        {
+            var prepared = PrepareRawPixels(pixelData);
+            return EnqueueWrite(
+                prepared.Buffer,
+                0,
+                G19Constants.LcdFullSize,
+                prepared.ReturnToPool,
+                prepared.UsesInternalBuffer,
+                timeout: G19Constants.LcdUpdateTimeout,
+                latest: false);
+        }
+
+        private ValueTask QueueRawPixelsLatestAsync(ReadOnlySpan<byte> pixelData)
+        {
+            var prepared = PrepareRawPixels(pixelData);
+            return EnqueueWrite(
+                prepared.Buffer,
+                0,
+                G19Constants.LcdFullSize,
+                prepared.ReturnToPool,
+                prepared.UsesInternalBuffer,
+                timeout: G19Constants.LcdUpdateTimeout,
+                latest: true);
+        }
+
+        private (byte[] Buffer, bool ReturnToPool, bool UsesInternalBuffer) PrepareRawPixels(ReadOnlySpan<byte> pixelData)
+        {
+            if (Interlocked.CompareExchange(ref _lcdBufferInFlight, 1, 0) == 0)
+            {
+                pixelData.CopyTo(_lcdBuffer.AsSpan(G19Constants.LcdHeaderSize, G19Constants.LcdDataSize));
+                return (_lcdBuffer, ReturnToPool: false, UsesInternalBuffer: true);
+            }
+
+            byte[] targetBuffer = _framePool.Rent(G19Constants.LcdFullSize);
+            Buffer.BlockCopy(G19Constants.LcdHeader, 0, targetBuffer, 0, G19Constants.LcdHeaderSize);
+            pixelData.CopyTo(targetBuffer.AsSpan(G19Constants.LcdHeaderSize, G19Constants.LcdDataSize));
+            return (targetBuffer, ReturnToPool: true, UsesInternalBuffer: false);
+        }
+
+        private ValueTask QueueFullFrameAsync(ReadOnlyMemory<byte> fullFrame)
+            => QueueFullFrame(fullFrame, latest: false);
+
+        private ValueTask QueueFullFrameLatestAsync(ReadOnlyMemory<byte> fullFrame)
+            => QueueFullFrame(fullFrame, latest: true);
+
+        private ValueTask QueueFullFrame(ReadOnlyMemory<byte> fullFrame, bool latest)
+        {
+            if (MemoryMarshal.TryGetArray(fullFrame, out ArraySegment<byte> segment)
+                && segment.Array != null
+                && segment.Count == G19Constants.LcdFullSize)
+            {
+                return EnqueueWrite(
+                    segment.Array,
+                    segment.Offset,
+                    segment.Count,
+                    returnToPool: false,
+                    usesInternalBuffer: false,
+                    timeout: G19Constants.LcdUpdateTimeout,
+                    latest: latest);
+            }
+
+            byte[] buffer = _framePool.Rent(G19Constants.LcdFullSize);
+            fullFrame.Span.CopyTo(buffer.AsSpan(0, G19Constants.LcdFullSize));
+            return EnqueueWrite(
+                buffer,
+                0,
+                G19Constants.LcdFullSize,
+                returnToPool: true,
+                usesInternalBuffer: false,
+                timeout: G19Constants.LcdUpdateTimeout,
+                latest: latest);
+        }
+
+        private ValueTask EnqueueWrite(
+            byte[] buffer,
+            int offset,
+            int length,
+            bool returnToPool,
+            bool usesInternalBuffer,
+            int timeout,
+            bool latest)
+        {
+            if (_disposed)
+            {
+                ReleaseBuffer(buffer, returnToPool, usesInternalBuffer);
+                throw new ObjectDisposedException(nameof(LCD));
+            }
+
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var pending = new PendingWrite(buffer, offset, length, timeout, returnToPool, usesInternalBuffer, tcs);
+
+            try
+            {
+                if (latest)
+                {
+                    _writeQueue.EnqueueLatest(
+                        pending,
+                        replaced => AbandonPendingWrite(replaced, new LcdFrameSupersededException()));
+                }
+                else
+                {
+                    _writeQueue.EnqueueOrdered(pending);
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                AbandonPendingWrite(pending, new ObjectDisposedException(nameof(LCD)));
+                throw;
+            }
+
+            return pending.AsValueTask();
+        }
+
+        private void AbandonPendingWrite(PendingWrite pending, Exception exception)
+        {
+            pending.Complete(success: false, exception);
+            ReleaseBuffer(pending.Buffer, pending.ReturnToPool, pending.UsesInternalBuffer);
+        }
+
+        private void ReleaseBuffer(byte[] buffer, bool returnToPool, bool usesInternalBuffer)
+        {
+            if (returnToPool)
+                _framePool.Return(buffer);
+
+            if (usesInternalBuffer)
+                Interlocked.Exchange(ref _lcdBufferInFlight, 0);
+        }
+
+        /// <summary>
+        /// Sets the LCD brightness.
+        /// </summary>
+        /// <param name="brightness">Brightness level from 0 to 100 inclusive.</param>
+        /// <remarks>
+        /// The control transfer retries by reconnecting the device if the write fails, which is useful after
+        /// suspend/resume or similar USB interruptions.
+        /// </remarks>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="brightness"/> is greater than 100.</exception>
+        /// <exception cref="InvalidOperationException">The LCD endpoint is not open.</exception>
+        /// <exception cref="ObjectDisposedException">This instance has already been disposed.</exception>
+        public void SetBrightness(byte brightness)
+        {
+            ThrowIfDisposed();
+
+            if (!IsAvailable)
+            {
+                throw new InvalidOperationException("Device must be opened before setting brightness.");
+            }
+
+            if (brightness > 100)
+            {
+                throw new ArgumentOutOfRangeException(nameof(brightness), "Brightness must be between 0 and 100.");
+            }
+
+            byte[] data = new byte[1] { brightness };
+
+            var packet = new UsbSetupPacket(
+                G19Constants.RequestTypeLcd,
+                G19Constants.RequestLcd,
+                0x00,
+                0x00,
+                (short)data.Length);
+            ControlTransferWithReconnect(ref packet, data);
+        }
+
+        /// <summary>
+        /// Apply gamma correction to a color value for more linear brightness perception
+        /// </summary>
+        /// <param name="value">Input value (0-255)</param>
+        /// <param name="gamma">Gamma to apply</param>
+        /// <returns>Gamma corrected value (0-255)</returns>
+        private static byte ApplyGammaCorrection(byte value, double gamma)
+        {
+            // Clamp gamma to a reasonable range
+            if (gamma <= 0.01)
+                gamma = 1.0;
+
+            double normalized = value / 255.0;
+            double corrected = Math.Pow(normalized, gamma);
+            int outVal = (int)Math.Round(corrected * 255.0);
+            if (outVal < 0) outVal = 0;
+            if (outVal > 255) outVal = 255;
+            return (byte)outVal;
+        }
+
+        // Per-channel gamma values. These can be tuned if white balance appears off.
+        private const double GammaR = 2.2;
+        private const double GammaG = 1.9;
+        private const double GammaB = 2.2;
+
+        /// <summary>
+        /// Sets the keyboard backlight colour.
+        /// </summary>
+        /// <param name="red">Red channel value from 0 to 255.</param>
+        /// <param name="green">Green channel value from 0 to 255.</param>
+        /// <param name="blue">Blue channel value from 0 to 255.</param>
+        /// <remarks>
+        /// Before sending the control transfer, the implementation remaps some near-white colours to compensate for the
+        /// hardware backlight. When green is at least 230 and red and blue are both within 70 of green, red and blue are
+        /// forced to 150 so the result appears whiter on the device. Primary colours are sent unchanged.
+        /// </remarks>
+        /// <exception cref="InvalidOperationException">The LCD endpoint is not open.</exception>
+        /// <exception cref="ObjectDisposedException">This instance has already been disposed.</exception>
+        public void SetBacklightColor(byte red, byte green, byte blue)
+        {
+            ThrowIfDisposed();
+
+            if (!IsAvailable)
+            {
+                throw new InvalidOperationException("Device must be opened before setting backlight.");
+            }
+
+            // Detect near-white mixes where green is very high and red/blue
+            // are reasonably close to green. In those cases remap red/blue
+            // to a target value that tends to look whiter on the backlight
+            // (example: (200,255,200) -> (150,255,150)). Primary colors
+            // (pure red/green/blue) are unaffected because green won't be
+            // both high and similar to red/blue.
+            const byte GreenHighThreshold = 230; // green must be high to consider remapping
+            const int WhiteSimilarityTolerance = 70; // how close R/B must be to G
+            const byte RemapRedBlueForWhite = 150; // target for R and B when remapping
+
+            byte outR = red;
+            byte outG = green;
+            byte outB = blue;
+
+            if (outG >= GreenHighThreshold &&
+                Math.Abs(outG - outR) <= WhiteSimilarityTolerance &&
+                Math.Abs(outG - outB) <= WhiteSimilarityTolerance)
+            {
+                // Remap red and blue to target to produce a better white.
+                outR = RemapRedBlueForWhite;
+                outB = RemapRedBlueForWhite;
+            }
+
+            // Send (possibly remapped) raw RGB channels directly to the device.
+            byte[] data = new byte[4];
+            data[0] = 255;  // Always 255 for color mode
+            data[1] = outR;
+            data[2] = outG;
+            data[3] = outB;
+
+            var packet = new UsbSetupPacket(
+                G19Constants.RequestTypeBacklight,
+                G19Constants.RequestBacklight,
+                G19Constants.ValueBacklight,
+                G19Constants.IndexBacklight,
+                (short)data.Length);
+
+            ControlTransferWithReconnect(ref packet, data);
+        }
+
+        /// <summary>
+        /// Attempt to reconnect the device by closing and reopening it.
+        /// Must be called under _deviceLock.
+        /// </summary>
+        /// <returns>True if reconnect succeeded.</returns>
+        private bool TryReconnect()
+        {
+            if (_disposed)
+            {
+                return false;
+            }
+
+            try
+            {
+                CloseDevice();
+                // Small delay before reopening the device
+                System.Threading.Thread.Sleep(DefaultReconnectDelayMs);
+                OpenDevice();
+                return IsAvailable;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Perform a bulk write and retry reconnecting on failure.
+        /// This avoids allocating a new delegate per call.
+        /// </summary>
+        private void BulkWriteWithReconnect(byte[] buffer, int offset, int length, int timeout)
+        {
+            lock (_deviceLock)
+            {
+                int attempts = 0;
+                while (true)
+                {
+                    if (_writer == null)
+                    {
+                        // Try to reconnect before the first attempt
+                        if (!TryReconnect())
+                        {
+                            attempts++;
+                            if (attempts > DefaultReconnectAttempts)
+                                throw new Exception("LCD writer not available and reconnect failed.");
+                            System.Threading.Thread.Sleep(DefaultReconnectDelayMs);
+                            continue;
+                        }
+                    }
+
+                    if (_writer == null)
+                        throw new InvalidOperationException("LCD writer unavailable after reconnect.");
+
+                    ErrorCode ec = _writer.Write(buffer, offset, length, timeout, out int transferred);
+                    if (ec == ErrorCode.None && transferred == length)
+                        return;
+
+                    attempts++;
+                    if (attempts > DefaultReconnectAttempts)
+                        throw new Exception($"Failed to update LCD: {ec} - {UsbDevice.LastErrorString}");
+
+                    // Try reconnect then retry
+                    if (!TryReconnect())
+                        System.Threading.Thread.Sleep(DefaultReconnectDelayMs);
+                }
+            }
+        }
+
+        private void ProcessWriteQueue(CancellationToken token)
+        {
+            try
+            {
+                while (_writeQueue.TryTake(token, out PendingWrite? pending) && pending != null)
+                {
+                    try
+                    {
+                        BulkWriteWithReconnect(pending.Buffer, pending.Offset, pending.Length, pending.Timeout);
+                        pending.Complete(success: true, exception: null);
+                    }
+                    catch (Exception ex)
+                    {
+                        pending.Complete(success: false, exception: ex);
+                    }
+                    finally
+                    {
+                        ReleaseBuffer(pending.Buffer, pending.ReturnToPool, pending.UsesInternalBuffer);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Queue shutdown requested.
+            }
+            finally
+            {
+                foreach (PendingWrite pending in _writeQueue.Complete())
+                    AbandonPendingWrite(pending, new ObjectDisposedException(nameof(LCD)));
+            }
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(LCD));
+            }
+        }
+
+        private sealed class PendingWrite
+        {
+            private readonly TaskCompletionSource<bool> _tcs;
+
+            public PendingWrite(byte[] buffer, int offset, int length, int timeout, bool returnToPool, bool usesInternalBuffer, TaskCompletionSource<bool> tcs)
+            {
+                Buffer = buffer;
+                Offset = offset;
+                Length = length;
+                Timeout = timeout;
+                ReturnToPool = returnToPool;
+                UsesInternalBuffer = usesInternalBuffer;
+                _tcs = tcs;
+            }
+
+            public byte[] Buffer { get; }
+            public int Offset { get; }
+            public int Length { get; }
+            public int Timeout { get; }
+            public bool ReturnToPool { get; }
+            public bool UsesInternalBuffer { get; }
+
+            public void Complete(bool success, Exception? exception)
+            {
+                if (success)
+                {
+                    _tcs.TrySetResult(true);
+                }
+                else if (exception != null)
+                {
+                    _tcs.TrySetException(exception);
+                }
+                else
+                {
+                    _tcs.TrySetCanceled();
+                }
+            }
+
+            public ValueTask AsValueTask()
+            {
+                return new ValueTask(_tcs.Task);
+            }
+        }
+
+        /// <summary>
+        /// Perform a control transfer and retry reconnecting on failure.
+        /// Checks the boolean result and throws on failure after retries.
+        /// </summary>
+        private void ControlTransferWithReconnect(ref UsbSetupPacket packet, byte[] data)
+        {
+            lock (_deviceLock)
+            {
+                int attempts = 0;
+                while (true)
+                {
+                    if (_usbDevice == null)
+                    {
+                        if (!TryReconnect())
+                        {
+                            attempts++;
+                            if (attempts > DefaultReconnectAttempts)
+                                throw new Exception("USB device not available and reconnect failed.");
+                            System.Threading.Thread.Sleep(DefaultReconnectDelayMs);
+                            continue;
+                        }
+                    }
+
+                    if (_usbDevice == null)
+                        throw new InvalidOperationException("USB device unavailable after reconnect.");
+
+                    bool ok = _usbDevice.ControlTransfer(ref packet, data, data.Length, out _);
+                    if (ok)
+                        return;
+
+                    attempts++;
+                    if (attempts > DefaultReconnectAttempts)
+                        throw new Exception($"Control transfer failed: {UsbDevice.LastErrorString}");
+
+                    if (!TryReconnect())
+                        System.Threading.Thread.Sleep(DefaultReconnectDelayMs);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Stops the internal write worker and closes the LCD transport.
+        /// </summary>
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+
+            _disposed = true;
+
+            foreach (PendingWrite pending in _writeQueue.Complete())
+                AbandonPendingWrite(pending, new ObjectDisposedException(nameof(LCD)));
+
+            try
+            {
+                _writeWorker.Wait();
+            }
+            catch (AggregateException ex) when (ex.InnerExceptions.Count == 1 && ex.InnerException is OperationCanceledException)
+            {
+                // Worker cancelled during shutdown; safe to ignore.
+            }
+
+            _writeCts.Cancel();
+            _writeCts.Dispose();
+            _writeQueue.Dispose();
+
+            CloseDevice();
+
+            if (_lcdBufferHandle.IsAllocated)
+            {
+                _lcdBufferHandle.Free();
+            }
+
+            Interlocked.Exchange(ref _lcdBufferInFlight, 0);
+            GC.SuppressFinalize(this);
+        }
+    }
+}

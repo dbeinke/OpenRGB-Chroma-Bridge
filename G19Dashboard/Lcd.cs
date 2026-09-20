@@ -1,11 +1,26 @@
-using System;
-using System.Runtime.InteropServices;
-public static class LcdProbe {
- const string D=@"C:\Program Files\Logitech Gaming Software\SDK\LCD\x64\LogitechLcd.dll";
- [DllImport(D,CharSet=CharSet.Unicode,CallingConvention=CallingConvention.Cdecl)] [return:MarshalAs(UnmanagedType.I1)] public static extern bool LogiLcdInit(string name,int type);
- [DllImport(D,CallingConvention=CallingConvention.Cdecl)] [return:MarshalAs(UnmanagedType.I1)] public static extern bool LogiLcdIsConnected(int type);
- [DllImport(D,CharSet=CharSet.Unicode,CallingConvention=CallingConvention.Cdecl)] [return:MarshalAs(UnmanagedType.I1)] public static extern bool LogiLcdColorSetTitle(string text,int r,int g,int b);
- [DllImport(D,CharSet=CharSet.Unicode,CallingConvention=CallingConvention.Cdecl)] [return:MarshalAs(UnmanagedType.I1)] public static extern bool LogiLcdColorSetText(int line,string text,int r,int g,int b);
- [DllImport(D,CallingConvention=CallingConvention.Cdecl)] public static extern void LogiLcdUpdate();
- [DllImport(D,CallingConvention=CallingConvention.Cdecl)] public static extern void LogiLcdShutdown();
+using G19USB;
+
+// LCD only: no keyboard input, macro handling, brightness or RGB writes.
+internal sealed class DirectUsbLcd : IDisposable
+{
+ private LCD? device;
+ public void Open()
+ {
+  if(device is not null)return;
+  var candidate=new LCD();
+  try {candidate.OpenDevice();device=candidate;}
+  catch {candidate.Dispose();throw;}
+ }
+ public void Show(Bitmap bitmap)
+ {
+  if(device is null)throw new InvalidOperationException("LCD is not open.");
+  device.UpdateScreen(Encode(bitmap)); // Wait for completion so errors reach the retry loop.
+ }
+ internal static byte[] Encode(Bitmap bitmap)
+ {
+  if(bitmap.Width!=320||bitmap.Height!=240)throw new ArgumentException("Expected a 320x240 dashboard frame.",nameof(bitmap));
+  return G19Helpers.ConvertBitmapToRGB565(bitmap);
+ }
+ public void Close(){var old=device;device=null;old?.Dispose();}
+ public void Dispose()=>Close();
 }

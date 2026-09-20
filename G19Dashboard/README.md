@@ -1,44 +1,61 @@
-# G19 System Dashboard
+# G19 Dashboard — direct USB migration
 
-A 320x240 LCD dashboard, refreshing once per second. The included layout is configured for an i9-11900K and RTX 4080; hardware labels are in Renderer.cs. Network selection is configured in dashboard-config.json.
+## Delivered
 
-- CPU: hottest core temperature in Celsius, current Core Temp CPU clock in GHz, and average core load.
-- GPU: NVIDIA core temperature, graphics clock, memory clock, and utilization.
-- Network: actual Ethernet 2 upload/download throughput in megabits per second (Mbps), including local-network traffic. These are traffic rates, not an internet speed test.
+Source and hardware-free tests. Publish a Windows x64 framework-dependent build using the commands below. Requires the .NET 9 Windows Desktop Runtime x64. The migration was subsequently installed and tested on a physical G19; see validation below.
 
-CPU data comes from the installed Core Temp shared-memory interface. GPU data comes directly from NVIDIA's installed NVML driver library. Network data uses Windows adapter byte counters. Missing sensor data displays `--` rather than invented readings. Network rates need two samples after startup. If Ethernet 2 disconnects, an active Ethernet/Wi-Fi adapter is selected, preferring one with a gateway.
+`Renderer.cs`, `Sensors.cs`, `background.png`, `dashboard-config.json`, and `start-sensors.ps1` are byte-for-byte identical to the uploaded project. CPU/Core Temp, NVIDIA/NVML, network selection, layout, refresh clamp (500–5000 ms), single-instance mutex, logs, and 30-second preview/metrics snapshots remain in place.
 
-The app uses the installed Logitech LCD SDK and requires Logitech Gaming Software (LCore) to be running. Select `G19 System Dashboard` with the G19 LCD app-switch controls if another applet is visible.
+The transport now uses the LCD-only API from G19USB and its column-major RGB565 encoder. Open failures and write failures dispose the connection and retry after five seconds; synchronous writes report failures to the existing loop. Upstream also retries failed transfers internally. RGB565 reduces color precision from the rendered 32-bit bitmap. The watchdog still checks every 15 seconds and restarts the dashboard and Core Temp task; its LCore launch was removed to avoid competing USB owners. No keyboard input, macros, backlight colors, M-key LEDs, or brightness settings are sent by this dashboard.
 
-## Installed setup
+## Build and tests
 
-App: `%LOCALAPPDATA%\Programs\G19 Dashboard\G19-Dashboard.exe`
-Config: `dashboard-config.json` beside the app. Supports `NetworkAdapter` and `RefreshMilliseconds` (500-5000).
-Logs and a periodically saved screen preview: `%LOCALAPPDATA%\G19 Dashboard`.
-Windows startup entry: `G19 Dashboard`, running `watchdog.ps1`.
-Scheduled task: `G19 Dashboard Sensors`, starts the installed Core Temp with the elevation needed for hardware sensors at sign-in.
-The watchdog keeps the dashboard, LCore, and Core Temp running. The existing RGB bridge is separate and remains unchanged.
+From the G19Dashboard folder, with .NET SDK 9 installed:
 
-To stop automatic startup, remove the `G19 Dashboard` value from the current user's Windows Run key and disable the `G19 Dashboard Sensors` scheduled task, then stop the watchdog and dashboard processes. Core Temp and Logitech software remain installed.
+```powershell
+dotnet build . -c Release
+dotnet test vendor/G19USB.Tests -c Release
+dotnet test tests -c Release
+dotnet publish . -c Release -r win-x64 --self-contained false -o ready-to-run
+Copy-Item watchdog.ps1,start-sensors.ps1 ready-to-run
+```
 
-## Display repair performed
+NuGet restores LibUsbDotNet 2.2.75 and the test dependencies. Keep the entire repository tree when building; the dashboard references the vendored source project.
 
-The LCD interface originally had no assigned driver and the LCD SDK registration was missing. The existing Logitech-signed LGPBTDD driver package was installed using pnputil, and the installed x64 LgLcdApi.dll and LogitechLcd.dll were registered. Windows now identifies the device as `Logitech G19 LCD`; the SDK connects and accepts frames. No driver-security setting was disabled.
+## Before a later hardware trial
 
-## Build
+1. Keep the original dashboard installation, configuration, artwork, watchdog, LGS installation, and the original uploaded ZIP. Back up the installed directory (normally `%LOCALAPPDATA%\Programs\G19 Dashboard`) to a separate folder. Do not overwrite it during the first trial.
+2. Record the existing `G19 Dashboard` startup command and the `G19 Dashboard Sensors` scheduled task settings. Pause the existing dashboard watchdog/startup and exit the dashboard before testing. Stop only its identified watchdog process, not all PowerShell processes. The old and new dashboards share the single-instance mutex; an existing instance makes a new invocation exit immediately.
+3. In Device Manager, record hardware IDs, device instance paths, driver provider/version, INF name, and screenshots of the G19 parent and child devices. Keep the original Logitech installer and driver package available. If the relevant original package is a third-party `oemNN.inf`, export that exact identified package with `pnputil /export-driver oemNN.inf <backup-folder>` from an elevated terminal. Do not guess an INF number. Inbox drivers may not be exportable.
+4. Have another keyboard/mouse available. Changing a composite parent can affect its child functions. The earlier conversation reported a repaired Logitech LCD driver; restoring only the parent may not restore that child binding automatically.
+5. For a driver-free preview, run `ready-to-run\G19-Dashboard.exe --preview` after stopping the existing dashboard. It reads sensors and writes `preview.png` and `metrics.json` under `%LOCALAPPDATA%\G19 Dashboard`, without opening USB. It uses the same data directory as the original app.
 
-Requires .NET 9 Desktop Runtime and the existing Logitech Gaming Software/Core Temp/NVIDIA driver installations.
+## Later libusbK / Zadig step — manual, not performed
 
-    dotnet publish -c Release -r win-x64 --self-contained false
+Follow the [pinned G19USB driver instructions](https://github.com/MagicMau/G19USB/tree/6016ff8394dd2980bb015d9e2db72bfd275a53f1). Close LGS/LCore and other programs accessing the G19 first; keep LGS installed for rollback.
 
-Run with `--preview` to write a live PNG and metrics JSON without opening the LCD. Exit an existing dashboard instance first because the application is single-instance.
+Download [Zadig from its official site](https://zadig.akeo.ie/) and run as administrator. Enable **Options > List All Devices**, and disable **Ignore Hubs or Composite Parents**. Select the G19/G19s **composite parent** with VID `046D`, PID `C229`, verifying against your recorded IDs. Do not select an `MI_00`/`MI_01` interface, USB hub, ordinary HID typing node, or another Logitech device. If the matching parent is not identifiable, stop and inspect the device tree before proceeding.
 
-## Validation
+Select **libusbK**, then **Replace Driver**. This is the upstream requirement even though this app opens only LCD interface 0. The publish output includes the managed USB dependency, not a driver installer or native USB runtime installer. A native-library load error after driver setup requires checking the official x64 libusbK runtime installation; do not download loose DLLs from third-party DLL sites.
 
-Release build passed with no warnings. Live Core Temp temperatures/clocks and network samples were read successfully. NVIDIA readings were checked against nvidia-smi. The installed dashboard connects to the repaired LCD, submits frames, and refreshes metrics. The sensor startup task completed with result 0. The RGB synchronization process continues operating.
+Run the new app manually from `ready-to-run`, without either watchdog. Check `%LOCALAPPDATA%\G19 Dashboard\dashboard.log` for `LCD direct USB initialized` and subsequent `LCD=True`. Verify colors/orientation, sensor updates, ordinary typing, special keys, and any RGB software. Then test unplug/replug and sleep/resume. Only after acceptance, deploy all ready-to-run files and point startup at the updated watchdog. It depends on the existing `G19 Dashboard Sensors` task; this package does not create that task.
 
-References: https://www.alcpu.com/CoreTemp/developers.html and the installed Logitech LCD SDK.
+## Rollback
 
-## Custom artwork
+1. Stop the new dashboard and its watchdog; disable any startup command pointing to it.
+2. In Device Manager, identify the exact `046D:C229` parent under libusbK using the recorded instance path. Use Driver > Roll Back Driver if available. Otherwise use Update Driver > Browse my computer > Let me pick to select the recorded original compatible driver.
+3. If that does not restore it, follow the [official Zadig recovery procedure](https://github.com/pbatard/libwdi/wiki/FAQ): uninstall that exact device, selecting removal of its Zadig-installed driver package when offered, then unplug/replug and let Windows rediscover it. Do not remove unrelated libusbK devices or packages.
+4. Restore the previously recorded Logitech child driver if necessary using the saved signed driver package or original LGS installer. Check the parent and LCD child against the recorded baseline. Reboot if Windows requests it.
+5. Restore the original dashboard folder/configuration and original watchdog/startup command, then start LGS and the original dashboard. Confirm typing, LCD, Core Temp, special keys and RGB behavior. Do not run the new and original watchdog together.
 
-The included background.png provides the Darkness metal-and-smoke artwork. Replace it with another 4:3 image and restart the dashboard to change the artwork. The renderer scales it to 320x240 and draws bright statistics directly above it with subtle black text shadows. If the image is unavailable, a solid dark background is used.
+## Validation and limits
+
+Release build and publish succeeded using SDK 9.0.205 on Windows x64 with zero build warnings/errors. All 56 upstream tests and 5 dashboard integration tests passed. Tests exercise actual bitmap encoding (colors, byte order, column order and corners), wrong-size rejection, unopened transport behavior, and renderer output with populated/missing metrics. Renderer previews were generated with synthetic test values; these are not live sensor measurements. Tests can be reproduced using the commands above.
+
+Physical G19 validation on 2026-09-20: libusbK 3.1.0.0 installed on the 046D:C229 composite parent; direct USB initialization and frame writes succeeded; the user confirmed the screen was visible and updating. The installed build and updated watchdog were started successfully. Unplug/replug, sleep/resume, and long-running watchdog recovery remain untested. G-keys/macros and LGS applet switching are not implemented; coexistence with OpenRGB/the existing RGB bridge is not guaranteed after the parent driver change. The app does not change LCD brightness, so retained hardware brightness may need separate adjustment. A basic physical display test passed; the recovery and coexistence limitations above still apply.
+
+## Third-party provenance
+
+G19USB source pinned to `6016ff8394dd2980bb015d9e2db72bfd275a53f1`, from https://github.com/MagicMau/G19USB. Apache-2.0 license and NOTICE are included. Local modifications: library/tests retargeted from .NET 10 to .NET 9; MinVer removed for a standalone source build; LCD bulk transfers must report the complete requested byte count before being accepted as successful. Other upstream source is preserved. Upstream documentation in `vendor/README.md` describes the original .NET 10 project, not this compatibility build.
+
+LibUsbDotNet 2.2.75 is distributed unmodified as a separate replaceable assembly. Its license is in `licenses/`, and corresponding source is available at https://github.com/LibUsbDotNet/LibUsbDotNet/tree/2d7289ab5d4059ac9bfbde666cfb0d4825d89814 (source commit from the package metadata: `2d7289ab5d4059ac9bfbde666cfb0d4825d89814`). Test dependencies are restored from NuGet and are not part of the ready-to-run distribution.

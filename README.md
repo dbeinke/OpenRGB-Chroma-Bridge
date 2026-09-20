@@ -8,12 +8,14 @@ temperature, core/memory clocks and load; and network upload/download rates.
 Bright statistics are drawn over the included custom Darkness background.
 
 The display refreshes once per second using Core Temp shared memory, NVIDIA NVML,
-and Windows network counters. The LCD uses Logitech Gaming Software's LCD SDK;
-the RGB backlight continues through the existing direct USB bridge.
+and Windows network counters. The LCD now uses G19USB with libusbK, without LGS.
+See the dashboard guide for driver setup, rollback, tests, and hardware validation.
 
 ![G19 dashboard with custom background](G19Dashboard/preview.png)
 
 ## Logitech G19 lighting
+
+**Driver compatibility:** The HID lighting backend below requires the original Windows composite/HID driver. The dashboard's libusbK composite-parent replacement removes that HID path. G19 RGB synchronization through this backend is therefore unavailable in direct-USB LCD mode; a shared USB lighting integration is not implemented. Other bridge lighting targets are unchanged.
 
 The bridge sends each shared animation frame directly to the G19's USB HID
 lighting interface (046D:C229, interface 1, vendor usage page FF00). Its feature
