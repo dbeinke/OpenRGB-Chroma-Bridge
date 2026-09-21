@@ -6,7 +6,7 @@ using System.Runtime.InteropServices;
 
 internal sealed record Metrics(DateTime Time, double? CpuTemp, double? CpuMHz, double? CpuLoad,
     double? GpuTemp, double? GpuMHz, double? GpuMemMHz, double? GpuLoad, double? VramGiB,
-    double? DownMbps, double? UpMbps, string Network, string CpuStatus, string GpuStatus);
+    double? DownMbps, double? UpMbps, string Network, string CpuStatus, string GpuStatus, double? RamUsedGiB=null, double? RamTotalGiB=null, double? RamLoad=null);
 
 internal sealed class Sensors : IDisposable
 {
@@ -19,6 +19,13 @@ internal sealed class Sensors : IDisposable
     [DllImport("nvml.dll", CallingConvention=CallingConvention.Cdecl)] private static extern int nvmlDeviceGetClockInfo(IntPtr device,uint type,out uint value);
     [DllImport("nvml.dll", CallingConvention=CallingConvention.Cdecl)] private static extern int nvmlDeviceGetUtilizationRates(IntPtr device,out Utilization value);
     [DllImport("nvml.dll", CallingConvention=CallingConvention.Cdecl)] private static extern int nvmlDeviceGetMemoryInfo(IntPtr device,out MemoryInfo value);
+    [StructLayout(LayoutKind.Sequential)] private struct MemoryStatus
+    {
+        public uint Length,Load;
+        public ulong TotalPhysical,AvailablePhysical,TotalPageFile,AvailablePageFile,TotalVirtual,AvailableVirtual,AvailableExtendedVirtual;
+    }
+    [DllImport("kernel32.dll",SetLastError=true)]
+    [return:MarshalAs(UnmanagedType.Bool)] private static extern bool GlobalMemoryStatusEx(ref MemoryStatus status);
     private IntPtr gpu;
     private bool nvmlReady;
     private string? networkId;
@@ -94,7 +101,15 @@ internal sealed class Sensors : IDisposable
             else {networkId=null;previousTicks=0;}
         }
         catch {networkId=null;previousTicks=0;}
-        return new(DateTime.Now,cpuTemp,cpuMHz,cpuLoad,gpuTemp,gpuMHz,gpuMem,gpuLoad,vram,down,up,network,cpuStatus,gpuStatus);
+        double? ramUsed=null,ramTotal=null,ramLoad=null;
+        var ram=new MemoryStatus{Length=(uint)Marshal.SizeOf<MemoryStatus>()};
+        if(GlobalMemoryStatusEx(ref ram)&&ram.TotalPhysical>0&&ram.AvailablePhysical<=ram.TotalPhysical)
+        {
+            ramTotal=ram.TotalPhysical/1073741824.0;
+            ramUsed=(ram.TotalPhysical-ram.AvailablePhysical)/1073741824.0;
+            ramLoad=100.0*(ram.TotalPhysical-ram.AvailablePhysical)/ram.TotalPhysical;
+        }
+        return new(DateTime.Now,cpuTemp,cpuMHz,cpuLoad,gpuTemp,gpuMHz,gpuMem,gpuLoad,vram,down,up,network,cpuStatus,gpuStatus,ramUsed,ramTotal,ramLoad);
     }
     public void Dispose(){if(nvmlReady)nvmlShutdown();}
 }

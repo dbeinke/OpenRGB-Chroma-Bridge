@@ -48,6 +48,11 @@ internal static class DashboardRenderer
         Text("Mem  "+N(m.GpuMemMHz)+" MHz",small,Muted,171,122,139);
         Bar(14,149,m.CpuLoad,Cyan);Bar(171,149,m.GpuLoad,Red);
         Text("Load "+N(m.GpuLoad)+"%",small,Muted,171,135,136);
+        Text("RAM",small,Cyan,14,159,32);
+        Text(N(m.RamUsedGiB,"0.0")+" / "+N(m.RamTotalGiB,"0.0")+" GiB",small,Color.White,49,159,140);
+        Text(N(m.RamLoad)+"%",small,Color.White,185,159,42);
+        Rect(Color.FromArgb(40,52,68),232,164,74,4);
+        if(m.RamLoad.HasValue)Rect(Cyan,232,164,(int)Math.Round(74*Math.Clamp(m.RamLoad.Value/100,0,1)),4);
         // Network statistics share the same full-screen background.
         Text("NETWORK",small,Muted,13,178,85);Text(m.Network.ToUpperInvariant(),small,Muted,101,178,205);
         Text("DOWN",small,Cyan,13,197,45);Text(N(m.DownMbps,"0.00"),medium,Color.White,55,193,95);Text("Mbps",small,Muted,112,216,45);
